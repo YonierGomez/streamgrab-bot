@@ -117,6 +117,53 @@ def normalize_video(filepath: str) -> str:
         return filepath
 
 
+def compress_to_fit(filepath: str, max_bytes: int = 49 * 1024 * 1024) -> str:
+    """Two-pass encode to fit under max_bytes, keeping original resolution."""
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "csv=p=0", filepath],
+            capture_output=True, text=True,
+        )
+        duration = float(probe.stdout.strip())
+        if duration <= 0:
+            return filepath
+
+        audio_bitrate = 128_000
+        target_video_bps = max(150_000, int(max_bytes * 8 / duration) - audio_bitrate)
+        passlog = filepath + "_pass"
+        output_path = filepath.rsplit(".", 1)[0] + "_fit.mp4"
+
+        # Pass 1
+        subprocess.run(
+            ["ffmpeg", "-i", filepath,
+             "-c:v", "libx264", "-b:v", str(target_video_bps),
+             "-pass", "1", "-passlogfile", passlog,
+             "-an", "-f", "null", "-y", "/dev/null"],
+            capture_output=True, check=True,
+        )
+        # Pass 2
+        subprocess.run(
+            ["ffmpeg", "-i", filepath,
+             "-c:v", "libx264", "-b:v", str(target_video_bps),
+             "-pass", "2", "-passlogfile", passlog,
+             "-c:a", "aac", "-b:a", "128k",
+             "-movflags", "+faststart", "-y", output_path],
+            capture_output=True, check=True,
+        )
+        for ext in ("-0.log", ".log"):
+            log_file = passlog + ext
+            if os.path.exists(log_file):
+                os.remove(log_file)
+
+        result_mb = os.path.getsize(output_path) / 1024 / 1024
+        logger.info(f"Compressed: {result_mb:.1f}MB @ {target_video_bps//1000}kbps (same resolution)")
+        return output_path
+    except Exception as e:
+        logger.warning(f"Compression failed: {e}")
+        return filepath
+
+
 def is_valid_url(text: str) -> bool:
     return bool(URL_REGEX.search(text))
 
@@ -244,13 +291,6 @@ async def handle_format_selection(update: Update, context: ContextTypes.DEFAULT_
 
             logger.info(f"Downloaded file: {filepath}, size: {os.path.getsize(filepath)}")
 
-            if os.path.getsize(filepath) > 50 * 1024 * 1024:
-                await query.edit_message_text(
-                    "⚠️ El archivo supera el límite de 50MB de Telegram.\n"
-                    "Intenta con una calidad menor."
-                )
-                return
-
             await query.edit_message_text("📤 Enviando archivo...")
             with open(filepath, "rb") as f:
                 if fmt["ext"] == "mp3":
@@ -259,6 +299,11 @@ async def handle_format_selection(update: Update, context: ContextTypes.DEFAULT_
                     filepath = await asyncio.get_event_loop().run_in_executor(
                         None, normalize_video, filepath
                     )
+                    if os.path.getsize(filepath) > 50 * 1024 * 1024:
+                        await query.edit_message_text("⚙️ Comprimiendo para Telegram (misma resolución)...")
+                        filepath = await asyncio.get_event_loop().run_in_executor(
+                            None, compress_to_fit, filepath
+                        )
                     width, height = get_video_dimensions(filepath)
                     with open(filepath, "rb") as fv:
                         await query.message.reply_video(
