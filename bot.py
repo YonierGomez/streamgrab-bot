@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
 ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW.isdigit() else None
+USE_LOCAL_API = os.getenv("TELEGRAM_LOCAL", "").lower() in ("1", "true", "yes")
+LOCAL_API_URL = "http://telegram-bot-api:8081/bot"
 URL_REGEX = re.compile(r"https?://[^\s]+")
 TRIM_REGEX = re.compile(r"^\d+:\d+\s+\d+:\d+$")
 WORK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot_work")
@@ -1185,7 +1187,8 @@ async def perform_download(
             parse_mode="Markdown"
         )
         ensure_not_cancelled(cancel_event)
-        analysis = await run_in_executor_cancellable(loop, cancel_event, analyze_video, filepath)
+        max_bytes = 2000 * 1024 * 1024 if USE_LOCAL_API else 49 * 1024 * 1024
+        analysis = await run_in_executor_cancellable(loop, cancel_event, analyze_video, filepath, max_bytes)
         ensure_not_cancelled(cancel_event)
 
         steps = []
@@ -1263,13 +1266,17 @@ def main():
         pool_timeout=30,
     )
 
-    app = (
+    builder = (
         Application.builder()
         .token(BOT_TOKEN)
         .request(request)
         .post_init(set_bot_commands)
-        .build()
     )
+    if USE_LOCAL_API:
+        builder = builder.base_url(LOCAL_API_URL).local_mode(True)
+        logger.info("Usando servidor local de Telegram Bot API (sin límite de 50MB)")
+
+    app = builder.build()
     ensure_runtime_state(app.bot_data)
 
 
