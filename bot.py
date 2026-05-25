@@ -265,10 +265,17 @@ async def handle_format_selection(update: Update, context: ContextTypes.DEFAULT_
                     await query.message.reply_audio(audio=f)
                 else:
                     size_mb = os.path.getsize(filepath) / 1024 / 1024
-                    msg = "⚙️ Procesando video..."
                     if size_mb > 50:
-                        msg = f"⚙️ Comprimiendo {size_mb:.0f}MB → <50MB\n⏳ Puede tardar hasta 1 minuto, por favor espera..."
-                    await query.edit_message_text(msg)
+                        status = (
+                            f"⚙️ *Comprimiendo video* ({size_mb:.0f}MB → <50MB)\n"
+                            f"⏳ Esto puede tardar hasta 1 minuto..."
+                        )
+                    else:
+                        status = (
+                            f"⚙️ *Procesando video* ({size_mb:.0f}MB)\n"
+                            f"🔧 Verificando codec y calidad..."
+                        )
+                    await query.edit_message_text(status, parse_mode="Markdown")
                     filepath = await asyncio.get_event_loop().run_in_executor(
                         None, process_video, filepath
                     )
