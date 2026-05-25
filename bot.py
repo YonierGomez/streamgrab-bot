@@ -107,7 +107,7 @@ def normalize_video(filepath: str) -> str:
         cmd = ["ffmpeg", "-i", filepath]
         if filters:
             cmd += ["-vf", ",".join(filters)]
-        cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "fast",
+        cmd += [        "-c:v", "libx264", "-crf", "18", "-preset", "ultrafast",
                 "-c:a", "copy", "-movflags", "+faststart", "-y", output_path]
         subprocess.run(cmd, capture_output=True, check=True)
         logger.info(f"Normalized: codec={codec} crop={crop_param} sar={sar} rotate={rotate}")
@@ -118,7 +118,7 @@ def normalize_video(filepath: str) -> str:
 
 
 def compress_to_fit(filepath: str, max_bytes: int = 49 * 1024 * 1024) -> str:
-    """Two-pass encode to fit under max_bytes, keeping original resolution."""
+    """Single-pass encode to fit under max_bytes, keeping original resolution."""
     try:
         probe = subprocess.run(
             ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
@@ -130,34 +130,22 @@ def compress_to_fit(filepath: str, max_bytes: int = 49 * 1024 * 1024) -> str:
             return filepath
 
         audio_bitrate = 128_000
-        target_video_bps = max(150_000, int(max_bytes * 8 / duration) - audio_bitrate)
-        passlog = filepath + "_pass"
+        # Target 47MB to account for single-pass bitrate variance
+        safe_bytes = int(max_bytes * 0.96)
+        target_video_bps = max(150_000, int(safe_bytes * 8 / duration) - audio_bitrate)
         output_path = filepath.rsplit(".", 1)[0] + "_fit.mp4"
 
-        # Pass 1
         subprocess.run(
             ["ffmpeg", "-i", filepath,
              "-c:v", "libx264", "-b:v", str(target_video_bps),
-             "-pass", "1", "-passlogfile", passlog,
-             "-an", "-f", "null", "-y", "/dev/null"],
-            capture_output=True, check=True,
-        )
-        # Pass 2
-        subprocess.run(
-            ["ffmpeg", "-i", filepath,
-             "-c:v", "libx264", "-b:v", str(target_video_bps),
-             "-pass", "2", "-passlogfile", passlog,
+             "-preset", "ultrafast",
              "-c:a", "aac", "-b:a", "128k",
              "-movflags", "+faststart", "-y", output_path],
             capture_output=True, check=True,
         )
-        for ext in ("-0.log", ".log"):
-            log_file = passlog + ext
-            if os.path.exists(log_file):
-                os.remove(log_file)
 
         result_mb = os.path.getsize(output_path) / 1024 / 1024
-        logger.info(f"Compressed: {result_mb:.1f}MB @ {target_video_bps//1000}kbps (same resolution)")
+        logger.info(f"Compressed: {result_mb:.1f}MB @ {target_video_bps//1000}kbps (ultrafast)")
         return output_path
     except Exception as e:
         logger.warning(f"Compression failed: {e}")
