@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 import yt_dlp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
@@ -1241,6 +1241,17 @@ async def perform_download(
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+async def set_bot_commands(application):
+    await application.bot.set_my_commands([
+        BotCommand("start",   "Mensaje de bienvenida"),
+        BotCommand("help",    "Ver todos los comandos y funciones"),
+        BotCommand("history", "Tus últimas 10 descargas"),
+        BotCommand("stats",   "Tus estadísticas de uso"),
+        BotCommand("cancel",  "Cancelar la descarga en curso"),
+        BotCommand("admin",   "Panel de administración (solo admin)"),
+    ])
+
+
 def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN no está configurado en el archivo .env")
@@ -1256,9 +1267,12 @@ def main():
         Application.builder()
         .token(BOT_TOKEN)
         .request(request)
+        .post_init(set_bot_commands)
         .build()
     )
     ensure_runtime_state(app.bot_data)
+
+
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
