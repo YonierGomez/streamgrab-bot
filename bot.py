@@ -1,11 +1,15 @@
 import os
 import re
 import json
+import uuid
+import shutil
 import hashlib
-import tempfile
 import logging
 import asyncio
 import subprocess
+from collections import deque
+from datetime import datetime
+
 from dotenv import load_dotenv
 import yt_dlp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -21,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 URL_REGEX = re.compile(r"https?://[^\s]+")
+TRIM_REGEX = re.compile(r"^\d+:\d+\s+\d+:\d+$")
+WORK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot_work")
 
 RESOLUTION_PRESETS = [
     (4320, "🎬 8K (4320p)"),
@@ -31,6 +37,34 @@ RESOLUTION_PRESETS = [
     (480,  "🎬 480p"),
     (360,  "🎬 360p"),
     (240,  "🎬 240p"),
+]
+
+PLAYLIST_FORMATS = [
+    {
+        "label": "🎬 1080p",
+        "ext": "mp4",
+        "format": "bestvideo[height<=1080][vcodec^=avc]+bestaudio/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+    },
+    {
+        "label": "🎬 720p",
+        "ext": "mp4",
+        "format": "bestvideo[height<=720][vcodec^=avc]+bestaudio/bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+    },
+    {
+        "label": "🎬 480p",
+        "ext": "mp4",
+        "format": "bestvideo[height<=480][vcodec^=avc]+bestaudio/bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+    },
+    {
+        "label": "🎬 360p",
+        "ext": "mp4",
+        "format": "bestvideo[height<=360][vcodec^=avc]+bestaudio/bestvideo[height<=360]+bestaudio/best[height<=360]/best",
+    },
+    {
+        "label": "🎵 MP3 Audio",
+        "ext": "mp3",
+        "format": "bestaudio/best",
+    },
 ]
 
 
@@ -147,13 +181,89 @@ def do_process_video(filepath: str, analysis: dict, max_bytes: int = 49 * 1024 *
         return filepath
 
 
+def ensure_runtime_state(bot_data: dict):
+    bot_data.setdefault("video_cache", {})
+    bot_data.setdefault("user_locks", {})
+    bot_data.setdefault("history", {})
+
+
+def get_user_lock(user_id: int, bot_data: dict) -> asyncio.Lock:
+    ensure_runtime_state(bot_data)
+    lock = bot_data["user_locks"].get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        bot_data["user_locks"][user_id] = lock
+    return lock
+
+
+def get_user_history(user_id: int, bot_data: dict) -> deque:
+    ensure_runtime_state(bot_data)
+    history = bot_data["history"].get(user_id)
+    if history is None:
+        history = deque(maxlen=10)
+        bot_data["history"][user_id] = history
+    return history
+
+
+def add_history_entry(bot_data: dict, user_id: int, title: str, url_key: str, fmt_idx: int, fmt_label: str):
+    history = get_user_history(user_id, bot_data)
+    history.appendleft({
+        "title": title,
+        "url_key": url_key,
+        "fmt_idx": fmt_idx,
+        "fmt_label": fmt_label,
+        "ts": datetime.utcnow().isoformat(timespec="seconds"),
+    })
+
+
 def is_valid_url(text: str) -> bool:
     return bool(URL_REGEX.search(text))
 
 
-def get_video_info(url: str) -> tuple[str, list[dict]]:
-    with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+def parse_time(value: str) -> str:
+    minutes, seconds = value.split(":", 1)
+    total_seconds = int(minutes) * 60 + int(seconds)
+    hours, remainder = divmod(total_seconds, 3600)
+    mins, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{mins:02d}:{secs:02d}"
+
+
+def parse_time_seconds(value: str) -> int:
+    minutes, seconds = value.split(":", 1)
+    return int(minutes) * 60 + int(seconds)
+
+
+def trim_video(filepath: str, start_time: str, end_time: str) -> str:
+    output_path = filepath.rsplit(".", 1)[0] + "_trimmed.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-i", filepath, "-ss", start_time, "-to", end_time,
+            "-c", "copy", "-y", output_path,
+        ],
+        capture_output=True,
+        check=True,
+    )
+    return output_path
+
+
+def make_work_dir() -> str:
+    os.makedirs(WORK_DIR, exist_ok=True)
+    path = os.path.join(WORK_DIR, uuid.uuid4().hex)
+    os.makedirs(path, exist_ok=False)
+    return path
+
+
+def get_video_info(url: str) -> dict:
+    with yt_dlp.YoutubeDL({"quiet": True, "extract_flat": "in_playlist"}) as ydl:
         info = ydl.extract_info(url, download=False)
+
+    if info.get("_type") == "playlist":
+        entries = [entry for entry in (info.get("entries") or []) if entry]
+        return {
+            "is_playlist": True,
+            "title": info.get("title", "playlist"),
+            "count": len(entries),
+        }
 
     title = info.get("title", "video")
     available_heights = {
@@ -175,16 +285,60 @@ def get_video_info(url: str) -> tuple[str, list[dict]]:
                 ),
             })
 
-    # Always offer MP3
     formats.append({"label": "🎵 MP3 Audio", "format": "bestaudio/best", "ext": "mp3"})
-    return title, formats
+    return {"is_playlist": False, "title": title, "formats": formats}
+
+
+def get_playlist_entries(url: str, count: int) -> tuple[str, list[dict]]:
+    ydl_opts = {"quiet": True, "noplaylist": False}
+    if count > 0:
+        ydl_opts["playlistend"] = count
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    entries = [entry for entry in (info.get("entries") or []) if entry]
+    return info.get("title", "playlist"), entries
 
 
 def build_keyboard(url_key: str, formats: list[dict]) -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(f["label"], callback_data=f"{i}|{url_key}")]
-        for i, f in enumerate(formats)
+        [InlineKeyboardButton(fmt["label"], callback_data=f"{i}|{url_key}")]
+        for i, fmt in enumerate(formats)
     ]
+    buttons.append([InlineKeyboardButton("✂️ Recortar video", callback_data=f"trim_menu:{url_key}")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_trim_keyboard(url_key: str, formats: list[dict]) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(fmt["label"], callback_data=f"trim:{i}:{url_key}")]
+        for i, fmt in enumerate(formats)
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_playlist_count_keyboard(url_key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Primeros 5", callback_data=f"plist:5:{url_key}")],
+        [InlineKeyboardButton("Primeros 10", callback_data=f"plist:10:{url_key}")],
+        [InlineKeyboardButton("Primeros 20", callback_data=f"plist:20:{url_key}")],
+        [InlineKeyboardButton("Todos", callback_data=f"plist:0:{url_key}")],
+    ])
+
+
+def build_playlist_format_keyboard(url_key: str, count: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(fmt["label"], callback_data=f"pfmt:{count}:{i}:{url_key}")]
+        for i, fmt in enumerate(PLAYLIST_FORMATS)
+    ])
+
+
+def build_history_keyboard(history: deque) -> InlineKeyboardMarkup:
+    buttons = []
+    for item in list(history)[:10]:
+        label = f"{item['title']} ({item['fmt_label']})"
+        buttons.append([
+            InlineKeyboardButton(label[:64], callback_data=f"hist:{item['url_key']}:{item['fmt_idx']}")
+        ])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -203,7 +357,6 @@ def download_video(url: str, fmt: dict, output_dir: str) -> str | None:
             "preferredquality": "192",
         }]
     else:
-        # Re-encode to H.264 only if needed (AV1, VP9, etc.)
         ydl_opts["postprocessors"] = [{
             "key": "FFmpegVideoRemuxer",
             "preferedformat": "mp4",
@@ -213,8 +366,112 @@ def download_video(url: str, fmt: dict, output_dir: str) -> str | None:
         }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
-    files = os.listdir(output_dir)
+    files = sorted(os.listdir(output_dir))
     return os.path.join(output_dir, files[0]) if files else None
+
+
+async def try_acquire_user_lock(user_id: int, bot_data: dict) -> asyncio.Lock | None:
+    lock = get_user_lock(user_id, bot_data)
+    if lock.locked():
+        return None
+    await lock.acquire()
+    return lock
+
+
+async def perform_download(
+    context: ContextTypes.DEFAULT_TYPE,
+    status_message,
+    reply_target,
+    *,
+    user_id: int,
+    url: str,
+    url_key: str,
+    fmt_idx: int,
+    fmt: dict,
+    title: str,
+    trim_range: tuple[str, str] | None = None,
+) -> str:
+    ensure_runtime_state(context.bot_data)
+    cache_key = hashlib.md5(f"{url_key}:{fmt['label']}".encode()).hexdigest()
+    is_trimmed = trim_range is not None
+
+    if fmt["ext"] != "mp3" and not is_trimmed:
+        cached_file_id = context.bot_data["video_cache"].get(cache_key)
+        if cached_file_id:
+            await status_message.edit_text("📦 Usando caché...")
+            await reply_target.reply_video(video=cached_file_id)
+            add_history_entry(context.bot_data, user_id, title, url_key, fmt_idx, fmt["label"])
+            return "cached"
+
+    workdir = make_work_dir()
+    try:
+        await status_message.edit_text(f"⬇️ Descargando en {fmt['label']}... esto puede tardar un momento.")
+        loop = asyncio.get_running_loop()
+        filepath = await loop.run_in_executor(None, download_video, url, fmt, workdir)
+        if not filepath or not os.path.exists(filepath):
+            await status_message.edit_text("❌ Error al descargar el video.")
+            return "error"
+
+        logger.info(f"Downloaded file: {filepath}, size: {os.path.getsize(filepath)}")
+
+        if trim_range:
+            if fmt["ext"] == "mp3":
+                await status_message.edit_text("❌ El recorte solo está disponible para video.")
+                return "error"
+            await status_message.edit_text("✂️ Recortando video...")
+            filepath = await loop.run_in_executor(None, trim_video, filepath, trim_range[0], trim_range[1])
+
+        with open(filepath, "rb") as media_file:
+            if fmt["ext"] == "mp3":
+                await status_message.edit_text("📤 Enviando audio...")
+                await reply_target.reply_audio(audio=media_file)
+                add_history_entry(context.bot_data, user_id, title, url_key, fmt_idx, fmt["label"])
+                return "success"
+
+        size_mb = os.path.getsize(filepath) / 1024 / 1024
+        await status_message.edit_text(
+            f"🔍 *Analizando video* ({size_mb:.0f} MB)...",
+            parse_mode="Markdown"
+        )
+        analysis = await loop.run_in_executor(None, analyze_video, filepath)
+
+        steps = []
+        if analysis["needs_encode"]:
+            steps.append(f"🔄 Convertir codec `{analysis['codec']}` → H.264")
+        if analysis["needs_crop"]:
+            steps.append("✂️ Recortar barras negras")
+        if analysis["needs_sar_fix"]:
+            steps.append("📐 Corregir proporción de píxeles")
+        if analysis["needs_compress"]:
+            steps.append(f"📦 Comprimir {size_mb:.0f}MB → <50MB")
+        if not steps:
+            steps.append("✅ Sin cambios necesarios, enviando tal cual")
+
+        eta = "~1 minuto" if analysis["needs_compress"] else "~segundos"
+        status = (
+            "⚙️ *Procesando video*\n\n"
+            + "\n".join(f"  • {step}" for step in steps)
+            + f"\n\n⏳ Tiempo estimado: {eta}"
+        )
+        await status_message.edit_text(status, parse_mode="Markdown")
+
+        filepath = await loop.run_in_executor(None, do_process_video, filepath, analysis)
+
+        await status_message.edit_text("📤 *Enviando video...*", parse_mode="Markdown")
+        width, height = await loop.run_in_executor(None, get_video_dimensions, filepath)
+        with open(filepath, "rb") as video_file:
+            sent_message = await reply_target.reply_video(
+                video=video_file,
+                width=width or None,
+                height=height or None,
+                supports_streaming=True,
+            )
+        if sent_message.video and not is_trimmed:
+            context.bot_data["video_cache"][cache_key] = sent_message.video.file_id
+        add_history_entry(context.bot_data, user_id, title, url_key, fmt_idx, fmt["label"])
+        return "success"
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 # --- Handlers ---
@@ -228,20 +485,104 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    history = get_user_history(user_id, context.bot_data)
+    if not history:
+        await update.message.reply_text("📭 No tienes descargas recientes.")
+        return
+
+    await update.message.reply_text(
+        "🕘 Tus últimas descargas:",
+        reply_markup=build_history_keyboard(history),
+    )
+
+
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
-    if not is_valid_url(url):
+    ensure_runtime_state(context.bot_data)
+    text = update.message.text.strip()
+    trim_pending = context.user_data.get("trim_pending")
+
+    if trim_pending:
+        if not TRIM_REGEX.match(text):
+            await update.message.reply_text(
+                "✂️ Escribe inicio y fin en formato `MM:SS MM:SS`\nEjemplo: `0:30 2:15`",
+                parse_mode="Markdown"
+            )
+            return
+
+        start_raw, end_raw = text.split()
+        start_seconds = parse_time_seconds(start_raw)
+        end_seconds = parse_time_seconds(end_raw)
+        if end_seconds <= start_seconds:
+            await update.message.reply_text("❌ El tiempo final debe ser mayor que el inicial.")
+            return
+
+        pending = context.user_data.pop("trim_pending")
+        entry = context.bot_data.get(pending["url_key"])
+        if not entry:
+            await update.message.reply_text("❌ URL expirada. Envía el enlace de nuevo.")
+            return
+
+        fmt_idx = pending["fmt_idx"]
+        fmt = entry["formats"][fmt_idx]
+        lock = await try_acquire_user_lock(update.effective_user.id, context.bot_data)
+        if lock is None:
+            await update.message.reply_text("⏳ Ya hay una descarga en curso. Espera un momento...")
+            return
+
+        status_message = await update.message.reply_text("✂️ Preparando recorte...")
+        try:
+            await perform_download(
+                context,
+                status_message,
+                update.message,
+                user_id=update.effective_user.id,
+                url=entry["url"],
+                url_key=pending["url_key"],
+                fmt_idx=fmt_idx,
+                fmt=fmt,
+                title=entry.get("title", "video"),
+                trim_range=(parse_time(start_raw), parse_time(end_raw)),
+            )
+        except Exception as e:
+            logger.error(f"Trim download error: {e}")
+            await status_message.edit_text("❌ Ocurrió un error durante el recorte.")
+        finally:
+            lock.release()
+        return
+
+    if not is_valid_url(text):
         await update.message.reply_text("❌ Envíame una URL válida (debe comenzar con http:// o https://).")
         return
 
     msg = await update.message.reply_text("🔍 Obteniendo información del video...")
     try:
-        title, formats = await asyncio.get_event_loop().run_in_executor(None, get_video_info, url)
-        url_key = hashlib.md5(url.encode()).hexdigest()[:12]
-        context.bot_data[url_key] = {"url": url, "formats": formats}
+        info = await asyncio.get_running_loop().run_in_executor(None, get_video_info, text)
+        url_key = hashlib.md5(text.encode()).hexdigest()[:12]
+
+        if info["is_playlist"]:
+            context.bot_data[url_key] = {
+                "url": text,
+                "title": info["title"],
+                "is_playlist": True,
+            }
+            await msg.edit_text(
+                f"🎬 *{info['title']}*\n{info['count']} videos\n\nCuántos descargar?",
+                reply_markup=build_playlist_count_keyboard(url_key),
+                parse_mode="Markdown"
+            )
+            return
+
+        context.bot_data[url_key] = {
+            "url": text,
+            "title": info["title"],
+            "formats": info["formats"],
+            "is_playlist": False,
+        }
         await msg.edit_text(
-            f"📹 *{title}*\n\nElige el formato de descarga:",
-            reply_markup=build_keyboard(url_key, formats),
+            f"📹 *{info['title']}*\n\nElige el formato de descarga:",
+            reply_markup=build_keyboard(url_key, info["formats"]),
             parse_mode="Markdown"
         )
     except Exception as e:
@@ -259,72 +600,188 @@ async def handle_format_selection(update: Update, context: ContextTypes.DEFAULT_
         if not entry:
             await query.edit_message_text("❌ URL expirada. Envía el enlace de nuevo.")
             return
-        url = entry["url"]
-        fmt = entry["formats"][int(idx)]
 
-        await query.edit_message_text(f"⬇️ Descargando en {fmt['label']}... esto puede tardar un momento.")
+        lock = await try_acquire_user_lock(query.from_user.id, context.bot_data)
+        if lock is None:
+            await query.edit_message_text("⏳ Ya hay una descarga en curso. Espera un momento...")
+            return
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            filepath = await asyncio.get_event_loop().run_in_executor(
-                None, download_video, url, fmt, tmpdir
+        try:
+            result = await perform_download(
+                context,
+                query.message,
+                query.message,
+                user_id=query.from_user.id,
+                url=entry["url"],
+                url_key=url_key,
+                fmt_idx=int(idx),
+                fmt=entry["formats"][int(idx)],
+                title=entry.get("title", "video"),
             )
-            if not filepath or not os.path.exists(filepath):
-                await query.edit_message_text("❌ Error al descargar el video.")
-                return
-
-            logger.info(f"Downloaded file: {filepath}, size: {os.path.getsize(filepath)}")
-
-            with open(filepath, "rb") as f:
-                if fmt["ext"] == "mp3":
-                    await query.edit_message_text("📤 Enviando audio...")
-                    await query.message.reply_audio(audio=f)
-                else:
-                    size_mb = os.path.getsize(filepath) / 1024 / 1024
-                    await query.edit_message_text(
-                        f"🔍 *Analizando video* ({size_mb:.0f} MB)...",
-                        parse_mode="Markdown"
-                    )
-                    loop = asyncio.get_event_loop()
-                    analysis = await loop.run_in_executor(None, analyze_video, filepath)
-
-                    # Build step-by-step status
-                    steps = []
-                    if analysis["needs_encode"]:
-                        steps.append(f"🔄 Convertir codec `{analysis['codec']}` → H.264")
-                    if analysis["needs_crop"]:
-                        steps.append("✂️ Recortar barras negras")
-                    if analysis["needs_sar_fix"]:
-                        steps.append("📐 Corregir proporción de píxeles")
-                    if analysis["needs_compress"]:
-                        steps.append(f"📦 Comprimir {size_mb:.0f}MB → <50MB")
-                    if not steps:
-                        steps.append("✅ Sin cambios necesarios, enviando tal cual")
-
-                    eta = "~1 minuto" if analysis["needs_compress"] else "~segundos"
-                    status = (
-                        f"⚙️ *Procesando video*\n\n"
-                        + "\n".join(f"  • {s}" for s in steps)
-                        + f"\n\n⏳ Tiempo estimado: {eta}"
-                    )
-                    await query.edit_message_text(status, parse_mode="Markdown")
-
-                    filepath = await loop.run_in_executor(None, do_process_video, filepath, analysis)
-
-                    await query.edit_message_text("📤 *Enviando video...*", parse_mode="Markdown")
-                    width, height = get_video_dimensions(filepath)
-                    with open(filepath, "rb") as fv:
-                        await query.message.reply_video(
-                            video=fv,
-                            width=width or None,
-                            height=height or None,
-                            supports_streaming=True,
-                        )
-
-        await query.delete_message()
-
+            if result == "success":
+                await query.delete_message()
+        finally:
+            lock.release()
     except Exception as e:
         logger.error(f"Download error: {e}")
         await query.edit_message_text("❌ Ocurrió un error durante la descarga.")
+
+
+async def handle_trim_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, url_key = query.data.split(":", 1)
+    entry = context.bot_data.get(url_key)
+    if not entry:
+        await query.edit_message_text("❌ URL expirada. Envía el enlace de nuevo.")
+        return
+
+    await query.edit_message_text(
+        "✂️ Elige el formato y luego dime los tiempos.",
+        reply_markup=build_trim_keyboard(url_key, entry["formats"]),
+    )
+
+
+async def handle_trim_format_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        _, idx, url_key = query.data.split(":", 2)
+        entry = context.bot_data.get(url_key)
+        if not entry:
+            await query.edit_message_text("❌ URL expirada. Envía el enlace de nuevo.")
+            return
+
+        context.user_data["trim_pending"] = {"url_key": url_key, "fmt_idx": int(idx)}
+        await query.edit_message_text(
+            "✂️ Escribe inicio y fin en formato `MM:SS MM:SS`\nEjemplo: `0:30 2:15`",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Trim selection error: {e}")
+        await query.edit_message_text("❌ No pude preparar el recorte.")
+
+
+async def handle_history_redownload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        _, url_key, fmt_idx = query.data.split(":", 2)
+        entry = context.bot_data.get(url_key)
+        if not entry:
+            await query.edit_message_text("❌ Ese elemento del historial ya expiró. Envía el enlace de nuevo.")
+            return
+
+        lock = await try_acquire_user_lock(query.from_user.id, context.bot_data)
+        if lock is None:
+            await query.edit_message_text("⏳ Ya hay una descarga en curso. Espera un momento...")
+            return
+
+        try:
+            result = await perform_download(
+                context,
+                query.message,
+                query.message,
+                user_id=query.from_user.id,
+                url=entry["url"],
+                url_key=url_key,
+                fmt_idx=int(fmt_idx),
+                fmt=entry["formats"][int(fmt_idx)],
+                title=entry.get("title", "video"),
+            )
+            if result == "success":
+                await query.delete_message()
+        finally:
+            lock.release()
+    except Exception as e:
+        logger.error(f"History redownload error: {e}")
+        await query.edit_message_text("❌ No pude repetir esa descarga.")
+
+
+async def handle_playlist_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        _, count, url_key = query.data.split(":", 2)
+        entry = context.bot_data.get(url_key)
+        if not entry:
+            await query.edit_message_text("❌ URL expirada. Envía el enlace de nuevo.")
+            return
+
+        count_value = int(count)
+        count_label = "Todos" if count_value == 0 else f"Primeros {count_value}"
+        await query.edit_message_text(
+            f"🎬 *{entry['title']}*\n\n{count_label}. Elige el formato:",
+            reply_markup=build_playlist_format_keyboard(url_key, count_value),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Playlist count error: {e}")
+        await query.edit_message_text("❌ No pude preparar la playlist.")
+
+
+async def handle_playlist_fmt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        _, count, idx, url_key = query.data.split(":", 3)
+        entry = context.bot_data.get(url_key)
+        if not entry:
+            await query.edit_message_text("❌ URL expirada. Envía el enlace de nuevo.")
+            return
+
+        lock = await try_acquire_user_lock(query.from_user.id, context.bot_data)
+        if lock is None:
+            await query.edit_message_text("⏳ Ya hay una descarga en curso. Espera un momento...")
+            return
+
+        try:
+            count_value = int(count)
+            fmt_idx = int(idx)
+            fmt = PLAYLIST_FORMATS[fmt_idx]
+            loop = asyncio.get_running_loop()
+            playlist_title, entries = await loop.run_in_executor(None, get_playlist_entries, entry["url"], count_value)
+            total = len(entries)
+            if total == 0:
+                await query.edit_message_text("❌ No pude obtener videos de la playlist.")
+                return
+
+            for position, item in enumerate(entries, start=1):
+                item_url = item.get("webpage_url") or item.get("url")
+                if not item_url:
+                    continue
+
+                item_title = item.get("title") or f"{playlist_title} #{position}"
+                item_url_key = hashlib.md5(item_url.encode()).hexdigest()[:12]
+                context.bot_data[item_url_key] = {
+                    "url": item_url,
+                    "title": item_title,
+                    "formats": PLAYLIST_FORMATS,
+                    "is_playlist": False,
+                }
+                await query.message.edit_text(f"⬇️ Descargando video {position}/{total}...")
+                await perform_download(
+                    context,
+                    query.message,
+                    query.message,
+                    user_id=query.from_user.id,
+                    url=item_url,
+                    url_key=item_url_key,
+                    fmt_idx=fmt_idx,
+                    fmt=fmt,
+                    title=item_title,
+                )
+
+            await query.message.edit_text("✅ Descarga de playlist completada.")
+        finally:
+            lock.release()
+    except Exception as e:
+        logger.error(f"Playlist download error: {e}")
+        await query.edit_message_text("❌ Ocurrió un error al descargar la playlist.")
 
 
 def main():
@@ -334,7 +791,7 @@ def main():
     request = HTTPXRequest(
         connect_timeout=30,
         read_timeout=60,
-        write_timeout=60,
+        write_timeout=300,
         pool_timeout=30,
     )
 
@@ -344,9 +801,17 @@ def main():
         .request(request)
         .build()
     )
+    ensure_runtime_state(app.bot_data)
+
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("history", history_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-    app.add_handler(CallbackQueryHandler(handle_format_selection))
+    app.add_handler(CallbackQueryHandler(handle_trim_menu, pattern=r"^trim_menu:"))
+    app.add_handler(CallbackQueryHandler(handle_trim_format_selection, pattern=r"^trim:"))
+    app.add_handler(CallbackQueryHandler(handle_history_redownload, pattern=r"^hist:"))
+    app.add_handler(CallbackQueryHandler(handle_playlist_count, pattern=r"^plist:"))
+    app.add_handler(CallbackQueryHandler(handle_playlist_fmt, pattern=r"^pfmt:"))
+    app.add_handler(CallbackQueryHandler(handle_format_selection, pattern=r"^\d+\|"))
 
     logger.info("Bot iniciado...")
     app.run_polling()
