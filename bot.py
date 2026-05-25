@@ -60,8 +60,8 @@ def get_video_dimensions(filepath: str) -> tuple[int, int]:
     return 0, 0
 
 
-def normalize_video(filepath: str) -> str:
-    """Ensure H.264 codec, crop black bars, fix SAR / rotation."""
+def process_video(filepath: str, max_bytes: int = 49 * 1024 * 1024) -> str:
+    """Normalize and compress in a single ffmpeg pass."""
     try:
         stream = _probe_video_stream(filepath)
         coded_w = stream.get("width", 0)
@@ -69,14 +69,17 @@ def normalize_video(filepath: str) -> str:
         sar = stream.get("sample_aspect_ratio") or "1:1"
         rotate = stream.get("tags", {}).get("rotate") or "0"
         codec = stream.get("codec_name", "")
+        file_size = os.path.getsize(filepath)
 
-        # Telegram only plays H.264 reliably
         needs_encode = codec not in ("h264", "avc1")
+        needs_sar_fix = sar not in ("1:1", "0:1", "")
+        needs_rotate_fix = rotate not in ("0", "")
+        needs_compress = file_size > max_bytes
 
-        # Detect embedded black bars
+        # Detect black bars (50 frames is enough for consistent bars)
         detect = subprocess.run(
             ["ffmpeg", "-i", filepath, "-vf", "cropdetect=24:16:0",
-             "-frames:v", "300", "-f", "null", "-"],
+             "-frames:v", "50", "-f", "null", "-"],
             capture_output=True, text=True
         )
         crop_param = None
@@ -91,10 +94,7 @@ def normalize_video(filepath: str) -> str:
                 cw, ch = int(parts[0]), int(parts[1])
                 needs_crop = cw < coded_w * 0.99 or ch < coded_h * 0.99
 
-        needs_sar_fix = sar not in ("1:1", "0:1", "")
-        needs_rotate_fix = rotate not in ("0", "")
-
-        if not needs_encode and not needs_crop and not needs_sar_fix and not needs_rotate_fix:
+        if not any([needs_encode, needs_sar_fix, needs_rotate_fix, needs_crop, needs_compress]):
             return filepath
 
         filters = []
@@ -103,52 +103,32 @@ def normalize_video(filepath: str) -> str:
         if needs_crop and crop_param:
             filters.append(f"crop={crop_param}")
 
-        output_path = filepath.rsplit(".", 1)[0] + "_norm.mp4"
+        output_path = filepath.rsplit(".", 1)[0] + "_out.mp4"
         cmd = ["ffmpeg", "-i", filepath]
         if filters:
             cmd += ["-vf", ",".join(filters)]
-        cmd += [        "-c:v", "libx264", "-crf", "18", "-preset", "ultrafast",
-                "-c:a", "copy", "-movflags", "+faststart", "-y", output_path]
+
+        if needs_compress:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", filepath],
+                capture_output=True, text=True,
+            )
+            duration = float(probe.stdout.strip() or 0)
+            safe_bytes = int(max_bytes * 0.96)
+            target_bps = max(150_000, int(safe_bytes * 8 / duration) - 128_000) if duration > 0 else 500_000
+            cmd += ["-c:v", "libx264", "-b:v", str(target_bps),
+                    "-c:a", "aac", "-b:a", "128k"]
+        else:
+            cmd += ["-c:v", "libx264", "-crf", "18", "-c:a", "copy"]
+
+        cmd += ["-preset", "ultrafast", "-movflags", "+faststart", "-y", output_path]
         subprocess.run(cmd, capture_output=True, check=True)
-        logger.info(f"Normalized: codec={codec} crop={crop_param} sar={sar} rotate={rotate}")
-        return output_path
-    except Exception as e:
-        logger.warning(f"Video normalization failed: {e}")
-        return filepath
-
-
-def compress_to_fit(filepath: str, max_bytes: int = 49 * 1024 * 1024) -> str:
-    """Single-pass encode to fit under max_bytes, keeping original resolution."""
-    try:
-        probe = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
-             "-of", "csv=p=0", filepath],
-            capture_output=True, text=True,
-        )
-        duration = float(probe.stdout.strip())
-        if duration <= 0:
-            return filepath
-
-        audio_bitrate = 128_000
-        # Target 47MB to account for single-pass bitrate variance
-        safe_bytes = int(max_bytes * 0.96)
-        target_video_bps = max(150_000, int(safe_bytes * 8 / duration) - audio_bitrate)
-        output_path = filepath.rsplit(".", 1)[0] + "_fit.mp4"
-
-        subprocess.run(
-            ["ffmpeg", "-i", filepath,
-             "-c:v", "libx264", "-b:v", str(target_video_bps),
-             "-preset", "ultrafast",
-             "-c:a", "aac", "-b:a", "128k",
-             "-movflags", "+faststart", "-y", output_path],
-            capture_output=True, check=True,
-        )
-
         result_mb = os.path.getsize(output_path) / 1024 / 1024
-        logger.info(f"Compressed: {result_mb:.1f}MB @ {target_video_bps//1000}kbps (ultrafast)")
+        logger.info(f"Processed: {result_mb:.1f}MB codec={codec} crop={needs_crop} compress={needs_compress}")
         return output_path
     except Exception as e:
-        logger.warning(f"Compression failed: {e}")
+        logger.warning(f"Video processing failed: {e}")
         return filepath
 
 
@@ -284,14 +264,10 @@ async def handle_format_selection(update: Update, context: ContextTypes.DEFAULT_
                 if fmt["ext"] == "mp3":
                     await query.message.reply_audio(audio=f)
                 else:
+                    await query.edit_message_text("⚙️ Procesando video...")
                     filepath = await asyncio.get_event_loop().run_in_executor(
-                        None, normalize_video, filepath
+                        None, process_video, filepath
                     )
-                    if os.path.getsize(filepath) > 50 * 1024 * 1024:
-                        await query.edit_message_text("⚙️ Comprimiendo para Telegram (misma resolución)...")
-                        filepath = await asyncio.get_event_loop().run_in_executor(
-                            None, compress_to_fit, filepath
-                        )
                     width, height = get_video_dimensions(filepath)
                     with open(filepath, "rb") as fv:
                         await query.message.reply_video(
