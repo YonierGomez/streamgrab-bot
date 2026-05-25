@@ -184,9 +184,9 @@ def do_process_video(filepath: str, analysis: dict, max_bytes: int = 49 * 1024 *
             target_bps = max(150_000, int(safe_bytes * 8 / a["duration"]) - 128_000) if a["duration"] > 0 else 500_000
             cmd += ["-c:v", "libx264", "-b:v", str(target_bps), "-c:a", "aac", "-b:a", "128k"]
         else:
-            cmd += ["-c:v", "libx264", "-crf", "23", "-c:a", "copy"]
+            cmd += ["-c:v", "libx264", "-crf", "16", "-c:a", "copy"]
 
-        cmd += ["-preset", "veryfast", "-movflags", "+faststart", "-y", output_path]
+        cmd += ["-preset", "slow", "-movflags", "+faststart", "-y", output_path]
         subprocess.run(cmd, capture_output=True, check=True)
         result_mb = os.path.getsize(output_path) / 1024 / 1024
         logger.info(f"Processed: {result_mb:.1f}MB analysis={a}")
