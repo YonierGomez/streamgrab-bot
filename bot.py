@@ -30,6 +30,10 @@ ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
 ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW.isdigit() else None
 USE_LOCAL_API = os.getenv("TELEGRAM_LOCAL", "").lower() in ("1", "true", "yes")
 LOCAL_API_URL = "http://telegram-bot-api:8081/bot"
+COOKIES_FILE = os.getenv("COOKIES_FILE", "")
+if COOKIES_FILE and not os.path.isfile(COOKIES_FILE):
+    logger.warning("COOKIES_FILE '%s' no existe — se ignorará", COOKIES_FILE)
+    COOKIES_FILE = ""
 URL_REGEX = re.compile(r"https?://[^\s]+")
 TRIM_REGEX = re.compile(r"^\d+:\d+\s+\d+:\d+$")
 WORK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot_work")
@@ -394,7 +398,10 @@ def make_work_dir() -> str:
 
 
 def get_video_info(url: str) -> dict:
-    with yt_dlp.YoutubeDL({"quiet": True, "extract_flat": "in_playlist"}) as ydl:
+    opts = {"quiet": True, "extract_flat": "in_playlist"}
+    if COOKIES_FILE:
+        opts["cookiefile"] = COOKIES_FILE
+    with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
 
     if info.get("_type") == "playlist":
@@ -432,6 +439,8 @@ def get_video_info(url: str) -> dict:
 
 def get_playlist_entries(url: str, count: int) -> tuple[str, list[dict]]:
     ydl_opts = {"quiet": True, "noplaylist": False}
+    if COOKIES_FILE:
+        ydl_opts["cookiefile"] = COOKIES_FILE
     if count > 0:
         ydl_opts["playlistend"] = count
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -514,6 +523,8 @@ def download_subtitles(url: str, output_dir: str) -> list[str]:
         "skip_download": True,
         "outtmpl": os.path.join(output_dir, "subtitle.%(ext)s"),
     }
+    if COOKIES_FILE:
+        ydl_opts["cookiefile"] = COOKIES_FILE
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
     subtitle_files = []
@@ -590,6 +601,8 @@ def download_video(
         "merge_output_format": fmt["ext"],
         "progress_hooks": [progress_hook],
     }
+    if COOKIES_FILE:
+        ydl_opts["cookiefile"] = COOKIES_FILE
     if fmt["ext"] == "mp3":
         ydl_opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
