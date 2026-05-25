@@ -1,3 +1,4 @@
+import io
 import os
 import re
 import json
@@ -7,8 +8,9 @@ import hashlib
 import logging
 import asyncio
 import subprocess
+import urllib.request
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 import yt_dlp
@@ -24,9 +26,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
+ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW.isdigit() else None
 URL_REGEX = re.compile(r"https?://[^\s]+")
 TRIM_REGEX = re.compile(r"^\d+:\d+\s+\d+:\d+$")
 WORK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot_work")
+SUPPORTED_DOMAINS = {
+    "youtube.com", "youtu.be", "facebook.com", "fb.watch", "instagram.com",
+    "tiktok.com", "twitter.com", "x.com", "vimeo.com", "reddit.com", "twitch.tv",
+}
+DOWNLOAD_PROGRESS = {}
 
 RESOLUTION_PRESETS = [
     (4320, "🎬 8K (4320p)"),
@@ -185,6 +194,13 @@ def ensure_runtime_state(bot_data: dict):
     bot_data.setdefault("video_cache", {})
     bot_data.setdefault("user_locks", {})
     bot_data.setdefault("history", {})
+    bot_data.setdefault("cancellation_flags", {})
+    stats = bot_data.setdefault("stats", {})
+    stats.setdefault("total", 0)
+    stats.setdefault("by_user", {})
+    stats.setdefault("by_platform", {})
+    stats.setdefault("by_day", {})
+    stats.setdefault("by_user_platform", {})
 
 
 def get_user_lock(user_id: int, bot_data: dict) -> asyncio.Lock:
@@ -214,6 +230,118 @@ def add_history_entry(bot_data: dict, user_id: int, title: str, url_key: str, fm
         "fmt_label": fmt_label,
         "ts": datetime.utcnow().isoformat(timespec="seconds"),
     })
+
+
+class UserCancelledError(Exception):
+    pass
+
+
+def get_cancellation_event(user_id: int, bot_data: dict) -> asyncio.Event:
+    ensure_runtime_state(bot_data)
+    event = bot_data["cancellation_flags"].get(user_id)
+    if event is None:
+        event = asyncio.Event()
+        bot_data["cancellation_flags"][user_id] = event
+    return event
+
+
+def detect_platform(url: str) -> str:
+    lowered = url.lower()
+    if any(domain in lowered for domain in ("youtube.com", "youtu.be")):
+        return "YouTube"
+    if any(domain in lowered for domain in ("instagram.com",)):
+        return "Instagram"
+    if any(domain in lowered for domain in ("tiktok.com",)):
+        return "TikTok"
+    if any(domain in lowered for domain in ("facebook.com", "fb.watch")):
+        return "Facebook"
+    if any(domain in lowered for domain in ("twitter.com", "x.com")):
+        return "Twitter"
+    if "vimeo.com" in lowered:
+        return "Vimeo"
+    if "reddit.com" in lowered:
+        return "Reddit"
+    if "twitch.tv" in lowered:
+        return "Twitch"
+    return "Otro"
+
+
+def record_stat(bot_data: dict, user_id: int, url: str, fmt_label: str):
+    ensure_runtime_state(bot_data)
+    stats = bot_data["stats"]
+    platform = detect_platform(url)
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    stats["total"] += 1
+    stats["by_user"][user_id] = stats["by_user"].get(user_id, 0) + 1
+    stats["by_platform"][platform] = stats["by_platform"].get(platform, 0) + 1
+    stats["by_day"][today] = stats["by_day"].get(today, 0) + 1
+    user_platforms = stats["by_user_platform"].setdefault(user_id, {})
+    user_platforms[platform] = user_platforms.get(platform, 0) + 1
+
+
+def ensure_not_cancelled(cancel_event: asyncio.Event | None):
+    if cancel_event and cancel_event.is_set():
+        raise asyncio.CancelledError
+
+
+def format_speed(speed: float | None) -> str:
+    if not speed:
+        return "—"
+    units = ["B/s", "KB/s", "MB/s", "GB/s"]
+    value = float(speed)
+    unit_idx = 0
+    while value >= 1024 and unit_idx < len(units) - 1:
+        value /= 1024
+        unit_idx += 1
+    decimals = 0 if unit_idx == 0 else 1
+    return f"{value:.{decimals}f} {units[unit_idx]}"
+
+
+def format_eta(eta: int | None) -> str:
+    if eta is None:
+        return "—"
+    eta = max(0, int(eta))
+    if eta < 60:
+        return f"{eta}s"
+    minutes, seconds = divmod(eta, 60)
+    return f"{minutes}m {seconds}s"
+
+
+def build_progress_bar(percent: float, width: int = 8) -> str:
+    percent = max(0.0, min(percent, 100.0))
+    filled = round((percent / 100) * width)
+    return "[" + "█" * filled + "░" * (width - filled) + "]"
+
+
+def format_progress_text(percent: float, speed: float | None, eta: int | None) -> str:
+    return (
+        f"⬇️ Descargando: {build_progress_bar(percent)} {percent:.0f}%"
+        f" • {format_speed(speed)} • ETA: {format_eta(eta)}"
+    )
+
+
+def is_retryable_download_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    user_error_markers = (
+        "unsupported url",
+        "video unavailable",
+        "requested format is not available",
+        "private video",
+        "login required",
+        "sign in",
+        "not available in your country",
+        "this live event will begin",
+    )
+    return not any(marker in message for marker in user_error_markers)
+
+
+async def safe_edit_text(message, text: str, **kwargs):
+    try:
+        await message.edit_text(text, **kwargs)
+    except Exception as exc:
+        if "Message is not modified" not in str(exc):
+            raise
 
 
 def is_valid_url(text: str) -> bool:
@@ -266,6 +394,7 @@ def get_video_info(url: str) -> dict:
         }
 
     title = info.get("title", "video")
+    thumbnail = info.get("thumbnail")
     available_heights = {
         fmt.get("height")
         for fmt in info.get("formats", [])
@@ -286,7 +415,7 @@ def get_video_info(url: str) -> dict:
             })
 
     formats.append({"label": "🎵 MP3 Audio", "format": "bestaudio/best", "ext": "mp3"})
-    return {"is_playlist": False, "title": title, "formats": formats}
+    return {"is_playlist": False, "title": title, "thumbnail": thumbnail, "formats": formats}
 
 
 def get_playlist_entries(url: str, count: int) -> tuple[str, list[dict]]:
@@ -304,6 +433,10 @@ def build_keyboard(url_key: str, formats: list[dict]) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(fmt["label"], callback_data=f"{i}|{url_key}")]
         for i, fmt in enumerate(formats)
     ]
+    buttons.append([
+        InlineKeyboardButton("📝 Subtítulos", callback_data=f"subs:{url_key}"),
+        InlineKeyboardButton("🖼 Portada", callback_data=f"thumb:{url_key}"),
+    ])
     buttons.append([InlineKeyboardButton("✂️ Recortar video", callback_data=f"trim_menu:{url_key}")])
     return InlineKeyboardMarkup(buttons)
 
@@ -342,13 +475,108 @@ def build_history_keyboard(history: deque) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
-def download_video(url: str, fmt: dict, output_dir: str) -> str | None:
+def clear_workdir(path: str):
+    for name in os.listdir(path):
+        full_path = os.path.join(path, name)
+        if os.path.isdir(full_path):
+            shutil.rmtree(full_path, ignore_errors=True)
+        else:
+            try:
+                os.remove(full_path)
+            except FileNotFoundError:
+                pass
+
+
+def fetch_remote_bytes(url: str) -> bytes:
+    with urllib.request.urlopen(url, timeout=30) as response:
+        return response.read()
+
+
+def download_subtitles(url: str, output_dir: str) -> list[str]:
+    ydl_opts = {
+        "quiet": True,
+        "noplaylist": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "subtitleslangs": ["es", "en"],
+        "skip_download": True,
+        "outtmpl": os.path.join(output_dir, "subtitle.%(ext)s"),
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+    subtitle_files = []
+    for name in sorted(os.listdir(output_dir)):
+        if name.lower().endswith((".srt", ".vtt")):
+            subtitle_files.append(os.path.join(output_dir, name))
+    return subtitle_files
+
+
+async def progress_message_worker(status_message, progress_queue: asyncio.Queue, stop_event: asyncio.Event):
+    loop = asyncio.get_running_loop()
+    latest = None
+    last_text = None
+    last_edit_at = 0.0
+    while True:
+        if stop_event.is_set() and progress_queue.empty():
+            break
+        try:
+            item = await asyncio.wait_for(progress_queue.get(), timeout=0.5)
+            if item is None:
+                break
+            latest = item
+        except asyncio.TimeoutError:
+            pass
+
+        if latest and loop.time() - last_edit_at >= 2:
+            text = format_progress_text(*latest)
+            if text != last_text:
+                await safe_edit_text(status_message, text)
+                last_text = text
+            last_edit_at = loop.time()
+
+    if latest:
+        text = format_progress_text(*latest)
+        if text != last_text:
+            await safe_edit_text(status_message, text)
+
+
+def download_video(
+    url: str,
+    fmt: dict,
+    output_dir: str,
+    progress_callback=None,
+    cancellation_event: asyncio.Event | None = None,
+) -> str | None:
+    def progress_hook(data: dict):
+        if cancellation_event and cancellation_event.is_set():
+            raise UserCancelledError("Download cancelled by user")
+
+        status = data.get("status")
+        if status == "downloading":
+            total_bytes = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
+            downloaded_bytes = data.get("downloaded_bytes") or 0
+            percent = (downloaded_bytes / total_bytes * 100) if total_bytes else 0.0
+            speed = data.get("speed")
+            eta = data.get("eta")
+            DOWNLOAD_PROGRESS[output_dir] = {
+                "percent": percent,
+                "speed": speed,
+                "eta": eta,
+            }
+            if progress_callback:
+                progress_callback(percent, speed, eta)
+        elif status == "finished":
+            DOWNLOAD_PROGRESS[output_dir] = {"percent": 100.0, "speed": None, "eta": 0}
+            if progress_callback:
+                progress_callback(100.0, None, 0)
+
     ydl_opts = {
         "format": fmt["format"],
         "outtmpl": os.path.join(output_dir, "output.%(ext)s"),
         "quiet": True,
         "noplaylist": True,
         "merge_output_format": fmt["ext"],
+        "progress_hooks": [progress_hook],
     }
     if fmt["ext"] == "mp3":
         ydl_opts["postprocessors"] = [{
@@ -378,109 +606,14 @@ async def try_acquire_user_lock(user_id: int, bot_data: dict) -> asyncio.Lock | 
     return lock
 
 
-async def perform_download(
-    context: ContextTypes.DEFAULT_TYPE,
-    status_message,
-    reply_target,
-    *,
-    user_id: int,
-    url: str,
-    url_key: str,
-    fmt_idx: int,
-    fmt: dict,
-    title: str,
-    trim_range: tuple[str, str] | None = None,
-) -> str:
-    ensure_runtime_state(context.bot_data)
-    cache_key = hashlib.md5(f"{url_key}:{fmt['label']}".encode()).hexdigest()
-    is_trimmed = trim_range is not None
-
-    if fmt["ext"] != "mp3" and not is_trimmed:
-        cached_file_id = context.bot_data["video_cache"].get(cache_key)
-        if cached_file_id:
-            await status_message.edit_text("📦 Usando caché...")
-            await reply_target.reply_video(video=cached_file_id)
-            add_history_entry(context.bot_data, user_id, title, url_key, fmt_idx, fmt["label"])
-            return "cached"
-
-    workdir = make_work_dir()
-    try:
-        await status_message.edit_text(f"⬇️ Descargando en {fmt['label']}... esto puede tardar un momento.")
-        loop = asyncio.get_running_loop()
-        filepath = await loop.run_in_executor(None, download_video, url, fmt, workdir)
-        if not filepath or not os.path.exists(filepath):
-            await status_message.edit_text("❌ Error al descargar el video.")
-            return "error"
-
-        logger.info(f"Downloaded file: {filepath}, size: {os.path.getsize(filepath)}")
-
-        if trim_range:
-            if fmt["ext"] == "mp3":
-                await status_message.edit_text("❌ El recorte solo está disponible para video.")
-                return "error"
-            await status_message.edit_text("✂️ Recortando video...")
-            filepath = await loop.run_in_executor(None, trim_video, filepath, trim_range[0], trim_range[1])
-
-        with open(filepath, "rb") as media_file:
-            if fmt["ext"] == "mp3":
-                await status_message.edit_text("📤 Enviando audio...")
-                await reply_target.reply_audio(audio=media_file)
-                add_history_entry(context.bot_data, user_id, title, url_key, fmt_idx, fmt["label"])
-                return "success"
-
-        size_mb = os.path.getsize(filepath) / 1024 / 1024
-        await status_message.edit_text(
-            f"🔍 *Analizando video* ({size_mb:.0f} MB)...",
-            parse_mode="Markdown"
-        )
-        analysis = await loop.run_in_executor(None, analyze_video, filepath)
-
-        steps = []
-        if analysis["needs_encode"]:
-            steps.append(f"🔄 Convertir codec `{analysis['codec']}` → H.264")
-        if analysis["needs_crop"]:
-            steps.append("✂️ Recortar barras negras")
-        if analysis["needs_sar_fix"]:
-            steps.append("📐 Corregir proporción de píxeles")
-        if analysis["needs_compress"]:
-            steps.append(f"📦 Comprimir {size_mb:.0f}MB → <50MB")
-        if not steps:
-            steps.append("✅ Sin cambios necesarios, enviando tal cual")
-
-        eta = "~1 minuto" if analysis["needs_compress"] else "~segundos"
-        status = (
-            "⚙️ *Procesando video*\n\n"
-            + "\n".join(f"  • {step}" for step in steps)
-            + f"\n\n⏳ Tiempo estimado: {eta}"
-        )
-        await status_message.edit_text(status, parse_mode="Markdown")
-
-        filepath = await loop.run_in_executor(None, do_process_video, filepath, analysis)
-
-        await status_message.edit_text("📤 *Enviando video...*", parse_mode="Markdown")
-        width, height = await loop.run_in_executor(None, get_video_dimensions, filepath)
-        with open(filepath, "rb") as video_file:
-            sent_message = await reply_target.reply_video(
-                video=video_file,
-                width=width or None,
-                height=height or None,
-                supports_streaming=True,
-            )
-        if sent_message.video and not is_trimmed:
-            context.bot_data["video_cache"][cache_key] = sent_message.video.file_id
-        add_history_entry(context.bot_data, user_id, title, url_key, fmt_idx, fmt["label"])
-        return "success"
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
-
-
 # --- Handlers ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Video Downloader Bot*\n\n"
         "Envíame el enlace de un video de:\n"
-        "▶️ YouTube\n📘 Facebook\n📸 Instagram\n🎵 TikTok",
+        "▶️ YouTube  📘 Facebook  📸 Instagram  🎵 TikTok\n"
+        "🐦 Twitter/X  📹 Vimeo  👾 Reddit  🎮 Twitch",
         parse_mode="Markdown"
     )
 
@@ -495,6 +628,81 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🕘 Tus últimas descargas:",
         reply_markup=build_history_keyboard(history),
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 *¿Qué puedo hacer?*\n\n"
+        "Envíame el enlace de un video y te mostraré opciones de descarga.\n\n"
+        "🌐 *Plataformas soportadas*\n"
+        "▶️ YouTube  📘 Facebook  📸 Instagram  🎵 TikTok\n"
+        "🐦 Twitter/X  📹 Vimeo  👾 Reddit  🎮 Twitch\n\n"
+        "🎛 *Al descargar puedes:*\n"
+        "• Elegir calidad (240p → 8K)\n"
+        "• 🖼 Descargar solo la portada\n"
+        "• 📝 Obtener subtítulos (.srt)\n"
+        "• ✂️ Recortar un fragmento (`MM:SS MM:SS`)\n"
+        "• 🎵 Extraer solo el audio (MP3)\n\n"
+        "📋 *Comandos disponibles*\n"
+        "/history — tus últimas 10 descargas\n"
+        "/stats — tus estadísticas de uso\n"
+        "/cancel — cancelar descarga en curso\n"
+        "/admin — panel de administración _(solo admin)_\n"
+        "/help — este mensaje",
+        parse_mode="Markdown"
+    )
+
+
+
+async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    event = get_cancellation_event(update.effective_user.id, context.bot_data)
+    event.set()
+    await update.message.reply_text("🛑 Cancelando descarga...")
+
+
+async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_runtime_state(context.bot_data)
+    user_id = update.effective_user.id
+    stats = context.bot_data["stats"]
+    total_user = stats["by_user"].get(user_id, 0)
+    user_platforms = stats["by_user_platform"].get(user_id, {})
+    if user_platforms:
+        top_platform, top_count = max(user_platforms.items(), key=lambda item: item[1])
+        top_text = f"{top_platform} ({top_count})"
+    else:
+        top_text = "Sin datos aún"
+
+    await update.message.reply_text(
+        f"📊 Tus estadísticas\n\nDescargas totales: {total_user}\nPlataforma favorita: {top_text}"
+    )
+
+
+async def handle_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if ADMIN_ID is None or update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ No tienes permisos.")
+        return
+
+    ensure_runtime_state(context.bot_data)
+    stats = context.bot_data["stats"]
+    top_users = sorted(stats["by_user"].items(), key=lambda item: item[1], reverse=True)[:5]
+    top_platforms = sorted(stats["by_platform"].items(), key=lambda item: item[1], reverse=True)
+
+    top_users_text = "\n".join(f"• {uid}: {count}" for uid, count in top_users) or "• Sin datos"
+    top_platforms_text = "\n".join(f"• {platform}: {count}" for platform, count in top_platforms) or "• Sin datos"
+
+    last_days = []
+    for days_ago in range(6, -1, -1):
+        day = (datetime.utcnow() - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+        last_days.append(f"• {day}: {stats['by_day'].get(day, 0)}")
+
+    await update.message.reply_text(
+        "🛠 *Panel admin*\n\n"
+        f"Total descargas: {stats['total']}\n\n"
+        f"*Top 5 usuarios*\n{top_users_text}\n\n"
+        f"*Plataformas*\n{top_platforms_text}\n\n"
+        f"*Últimos 7 días*\n{chr(10).join(last_days)}",
+        parse_mode="Markdown"
     )
 
 
@@ -545,9 +753,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 title=entry.get("title", "video"),
                 trim_range=(parse_time(start_raw), parse_time(end_raw)),
             )
-        except Exception as e:
-            logger.error(f"Trim download error: {e}")
-            await status_message.edit_text("❌ Ocurrió un error durante el recorte.")
         finally:
             lock.release()
         return
@@ -577,9 +782,16 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot_data[url_key] = {
             "url": text,
             "title": info["title"],
+            "thumbnail": info.get("thumbnail"),
             "formats": info["formats"],
             "is_playlist": False,
         }
+        if info.get("thumbnail"):
+            try:
+                await update.message.reply_photo(photo=info["thumbnail"], caption=info["title"][:1024])
+            except Exception as thumb_error:
+                logger.warning(f"Thumbnail preview failed: {thumb_error}")
+
         await msg.edit_text(
             f"📹 *{info['title']}*\n\nElige el formato de descarga:",
             reply_markup=build_keyboard(url_key, info["formats"]),
@@ -618,13 +830,75 @@ async def handle_format_selection(update: Update, context: ContextTypes.DEFAULT_
                 fmt=entry["formats"][int(idx)],
                 title=entry.get("title", "video"),
             )
-            if result == "success":
+            if result in {"success", "cached"}:
                 await query.delete_message()
         finally:
             lock.release()
     except Exception as e:
         logger.error(f"Download error: {e}")
         await query.edit_message_text("❌ Ocurrió un error durante la descarga.")
+
+
+async def handle_subtitles(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, url_key = query.data.split(":", 1)
+    entry = context.bot_data.get(url_key)
+    if not entry:
+        await query.edit_message_text("❌ URL expirada. Envía el enlace de nuevo.")
+        return
+
+    lock = await try_acquire_user_lock(query.from_user.id, context.bot_data)
+    if lock is None:
+        await query.message.reply_text("⏳ Ya hay una descarga en curso. Espera un momento...")
+        return
+
+    status_message = await query.message.reply_text("📝 Buscando subtítulos...")
+    workdir = make_work_dir()
+    try:
+        loop = asyncio.get_running_loop()
+        subtitles = await loop.run_in_executor(None, download_subtitles, entry["url"], workdir)
+        if not subtitles:
+            await safe_edit_text(status_message, "❌ Este video no tiene subtítulos disponibles.")
+            return
+
+        for subtitle_path in subtitles:
+            with open(subtitle_path, "rb") as subtitle_file:
+                await query.message.reply_document(document=subtitle_file)
+        await safe_edit_text(status_message, "✅ Subtítulos enviados.")
+    except Exception as e:
+        logger.error(f"Subtitle download error: {e}")
+        await safe_edit_text(status_message, "❌ No pude descargar los subtítulos.")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+        lock.release()
+
+
+async def handle_thumbnail_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, url_key = query.data.split(":", 1)
+    entry = context.bot_data.get(url_key)
+    if not entry:
+        await query.edit_message_text("❌ URL expirada. Envía el enlace de nuevo.")
+        return
+
+    thumbnail_url = entry.get("thumbnail")
+    if not thumbnail_url:
+        await query.message.reply_text("❌ Este video no tiene miniatura disponible.")
+        return
+
+    status_message = await query.message.reply_text("🖼 Descargando miniatura...")
+    try:
+        loop = asyncio.get_running_loop()
+        image_bytes = await loop.run_in_executor(None, fetch_remote_bytes, thumbnail_url)
+        image_file = io.BytesIO(image_bytes)
+        image_file.name = "thumbnail.jpg"
+        await query.message.reply_photo(photo=image_file)
+        await safe_edit_text(status_message, "✅ Portada enviada.")
+    except Exception as e:
+        logger.error(f"Thumbnail download error: {e}")
+        await safe_edit_text(status_message, "❌ No pude descargar la miniatura.")
 
 
 async def handle_trim_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -691,7 +965,7 @@ async def handle_history_redownload(update: Update, context: ContextTypes.DEFAUL
                 fmt=entry["formats"][int(fmt_idx)],
                 title=entry.get("title", "video"),
             )
-            if result == "success":
+            if result in {"success", "cached"}:
                 await query.delete_message()
         finally:
             lock.release()
@@ -751,6 +1025,11 @@ async def handle_playlist_fmt(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return
 
             for position, item in enumerate(entries, start=1):
+                cancel_event = get_cancellation_event(query.from_user.id, context.bot_data)
+                if cancel_event.is_set():
+                    await safe_edit_text(query.message, "🛑 Descarga de playlist cancelada.")
+                    return
+
                 item_url = item.get("webpage_url") or item.get("url")
                 if not item_url:
                     continue
@@ -760,11 +1039,12 @@ async def handle_playlist_fmt(update: Update, context: ContextTypes.DEFAULT_TYPE
                 context.bot_data[item_url_key] = {
                     "url": item_url,
                     "title": item_title,
+                    "thumbnail": item.get("thumbnail"),
                     "formats": PLAYLIST_FORMATS,
                     "is_playlist": False,
                 }
-                await query.message.edit_text(f"⬇️ Descargando video {position}/{total}...")
-                await perform_download(
+                await safe_edit_text(query.message, f"⬇️ Descargando video {position}/{total}...")
+                result = await perform_download(
                     context,
                     query.message,
                     query.message,
@@ -775,13 +1055,186 @@ async def handle_playlist_fmt(update: Update, context: ContextTypes.DEFAULT_TYPE
                     fmt=fmt,
                     title=item_title,
                 )
+                if result == "cancelled":
+                    await safe_edit_text(query.message, "🛑 Descarga de playlist cancelada.")
+                    return
+                if result not in {"success", "cached"}:
+                    return
 
-            await query.message.edit_text("✅ Descarga de playlist completada.")
+            await safe_edit_text(query.message, "✅ Descarga de playlist completada.")
         finally:
             lock.release()
     except Exception as e:
         logger.error(f"Playlist download error: {e}")
         await query.edit_message_text("❌ Ocurrió un error al descargar la playlist.")
+
+
+async def perform_download(
+    context: ContextTypes.DEFAULT_TYPE,
+    status_message,
+    reply_target,
+    *,
+    user_id: int,
+    url: str,
+    url_key: str,
+    fmt_idx: int,
+    fmt: dict,
+    title: str,
+    trim_range: tuple[str, str] | None = None,
+) -> str:
+    ensure_runtime_state(context.bot_data)
+    cache_key = hashlib.md5(f"{url_key}:{fmt['label']}".encode()).hexdigest()
+    is_trimmed = trim_range is not None
+    cancel_event = get_cancellation_event(user_id, context.bot_data)
+    cancel_event.clear()
+
+    if fmt["ext"] != "mp3" and not is_trimmed:
+        cached_file_id = context.bot_data["video_cache"].get(cache_key)
+        if cached_file_id:
+            await safe_edit_text(status_message, "📦 Usando caché...")
+            await reply_target.reply_video(video=cached_file_id)
+            add_history_entry(context.bot_data, user_id, title, url_key, fmt_idx, fmt["label"])
+            record_stat(context.bot_data, user_id, url, fmt["label"])
+            return "cached"
+
+    workdir = make_work_dir()
+    loop = asyncio.get_running_loop()
+    progress_queue = None
+    progress_stop = None
+    progress_task = None
+
+    async def stop_progress_worker():
+        nonlocal progress_queue, progress_stop, progress_task
+        if progress_task:
+            progress_stop.set()
+            await progress_queue.put(None)
+            await progress_task
+            progress_queue = None
+            progress_stop = None
+            progress_task = None
+
+    try:
+        ensure_not_cancelled(cancel_event)
+        filepath = None
+        for attempt in range(1, 4):
+            ensure_not_cancelled(cancel_event)
+            clear_workdir(workdir)
+            progress_queue = asyncio.Queue()
+            progress_stop = asyncio.Event()
+            progress_task = asyncio.create_task(progress_message_worker(status_message, progress_queue, progress_stop))
+
+            def progress_callback(percent, speed, eta):
+                if progress_stop.is_set():
+                    return
+                DOWNLOAD_PROGRESS[workdir] = {"percent": percent, "speed": speed, "eta": eta}
+                asyncio.run_coroutine_threadsafe(progress_queue.put((percent, speed, eta)), loop)
+
+            if attempt > 1:
+                await safe_edit_text(status_message, f"⚠️ Reintentando descarga (intento {attempt}/3)...")
+            try:
+                filepath = await loop.run_in_executor(None, download_video, url, fmt, workdir, progress_callback, cancel_event)
+                await stop_progress_worker()
+                break
+            except UserCancelledError:
+                await stop_progress_worker()
+                raise asyncio.CancelledError
+            except asyncio.CancelledError:
+                await stop_progress_worker()
+                raise
+            except Exception as exc:
+                await stop_progress_worker()
+                logger.warning(f"Download attempt {attempt}/3 failed: {exc}")
+                if attempt == 3 or not is_retryable_download_error(exc):
+                    raise
+                await safe_edit_text(status_message, f"⚠️ Reintentando descarga (intento {attempt + 1}/3)...")
+                await asyncio.sleep(2 ** attempt)
+
+        ensure_not_cancelled(cancel_event)
+        if not filepath or not os.path.exists(filepath):
+            await safe_edit_text(status_message, "❌ Error al descargar el video.")
+            return "error"
+
+        logger.info(f"Downloaded file: {filepath}, size: {os.path.getsize(filepath)}")
+
+        if trim_range:
+            if fmt["ext"] == "mp3":
+                await safe_edit_text(status_message, "❌ El recorte solo está disponible para video.")
+                return "error"
+            ensure_not_cancelled(cancel_event)
+            await safe_edit_text(status_message, "✂️ Recortando video...")
+            filepath = await loop.run_in_executor(None, trim_video, filepath, trim_range[0], trim_range[1])
+            ensure_not_cancelled(cancel_event)
+
+        with open(filepath, "rb") as media_file:
+            if fmt["ext"] == "mp3":
+                ensure_not_cancelled(cancel_event)
+                await safe_edit_text(status_message, "📤 Enviando audio...")
+                await reply_target.reply_audio(audio=media_file)
+                add_history_entry(context.bot_data, user_id, title, url_key, fmt_idx, fmt["label"])
+                record_stat(context.bot_data, user_id, url, fmt["label"])
+                return "success"
+
+        size_mb = os.path.getsize(filepath) / 1024 / 1024
+        await safe_edit_text(
+            status_message,
+            f"🔍 *Analizando video* ({size_mb:.0f} MB)...",
+            parse_mode="Markdown"
+        )
+        ensure_not_cancelled(cancel_event)
+        analysis = await loop.run_in_executor(None, analyze_video, filepath)
+        ensure_not_cancelled(cancel_event)
+
+        steps = []
+        if analysis["needs_encode"]:
+            steps.append(f"🔄 Convertir codec `{analysis['codec']}` → H.264")
+        if analysis["needs_crop"]:
+            steps.append("✂️ Recortar barras negras")
+        if analysis["needs_sar_fix"]:
+            steps.append("📐 Corregir proporción de píxeles")
+        if analysis["needs_compress"]:
+            steps.append(f"📦 Comprimir {size_mb:.0f}MB → <50MB")
+        if not steps:
+            steps.append("✅ Sin cambios necesarios, enviando tal cual")
+
+        eta = "~1 minuto" if analysis["needs_compress"] else "~segundos"
+        status = (
+            "⚙️ *Procesando video*\n\n"
+            + "\n".join(f"  • {step}" for step in steps)
+            + f"\n\n⏳ Tiempo estimado: {eta}"
+        )
+        await safe_edit_text(status_message, status, parse_mode="Markdown")
+
+        filepath = await loop.run_in_executor(None, do_process_video, filepath, analysis)
+        ensure_not_cancelled(cancel_event)
+
+        await safe_edit_text(status_message, "📤 *Enviando video...*", parse_mode="Markdown")
+        width, height = await loop.run_in_executor(None, get_video_dimensions, filepath)
+        ensure_not_cancelled(cancel_event)
+        with open(filepath, "rb") as video_file:
+            sent_message = await reply_target.reply_video(
+                video=video_file,
+                width=width or None,
+                height=height or None,
+                supports_streaming=True,
+            )
+        if sent_message.video and not is_trimmed:
+            context.bot_data["video_cache"][cache_key] = sent_message.video.file_id
+        add_history_entry(context.bot_data, user_id, title, url_key, fmt_idx, fmt["label"])
+        record_stat(context.bot_data, user_id, url, fmt["label"])
+        return "success"
+    except asyncio.CancelledError:
+        await stop_progress_worker()
+        await safe_edit_text(status_message, "🛑 Descarga cancelada.")
+        return "cancelled"
+    except Exception as exc:
+        await stop_progress_worker()
+        logger.error(f"perform_download error: {exc}")
+        await safe_edit_text(status_message, "❌ Ocurrió un error durante la descarga.")
+        return "error"
+    finally:
+        DOWNLOAD_PROGRESS.pop(workdir, None)
+        cancel_event.clear()
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def main():
@@ -804,10 +1257,16 @@ def main():
     ensure_runtime_state(app.bot_data)
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("history", history_command))
+    app.add_handler(CommandHandler("cancel", handle_cancel))
+    app.add_handler(CommandHandler("stats", handle_stats))
+    app.add_handler(CommandHandler("admin", handle_admin))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     app.add_handler(CallbackQueryHandler(handle_trim_menu, pattern=r"^trim_menu:"))
     app.add_handler(CallbackQueryHandler(handle_trim_format_selection, pattern=r"^trim:"))
+    app.add_handler(CallbackQueryHandler(handle_subtitles, pattern=r"^subs:"))
+    app.add_handler(CallbackQueryHandler(handle_thumbnail_download, pattern=r"^thumb:"))
     app.add_handler(CallbackQueryHandler(handle_history_redownload, pattern=r"^hist:"))
     app.add_handler(CallbackQueryHandler(handle_playlist_count, pattern=r"^plist:"))
     app.add_handler(CallbackQueryHandler(handle_playlist_fmt, pattern=r"^pfmt:"))
