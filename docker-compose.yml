@@ -10,6 +10,12 @@ services:
       - telegram-bot-api-data:/var/lib/telegram-bot-api
     ports:
       - "8081:8081"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
 
   streamgrab:
     build: .
@@ -20,7 +26,8 @@ services:
       ADMIN_ID: ${ADMIN_ID:-}
       TELEGRAM_LOCAL: "true"
     depends_on:
-      - telegram-bot-api
+      telegram-bot-api:
+        condition: service_healthy
 
 volumes:
   telegram-bot-api-data:
