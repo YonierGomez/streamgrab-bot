@@ -122,7 +122,7 @@ def process_video(filepath: str, max_bytes: int = 49 * 1024 * 1024) -> str:
         else:
             cmd += ["-c:v", "libx264", "-crf", "18", "-c:a", "copy"]
 
-        cmd += ["-preset", "ultrafast", "-movflags", "+faststart", "-y", output_path]
+        cmd += ["-preset", "veryfast", "-movflags", "+faststart", "-y", output_path]
         subprocess.run(cmd, capture_output=True, check=True)
         result_mb = os.path.getsize(output_path) / 1024 / 1024
         logger.info(f"Processed: {result_mb:.1f}MB codec={codec} crop={needs_crop} compress={needs_compress}")
