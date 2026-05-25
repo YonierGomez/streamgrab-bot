@@ -178,9 +178,9 @@ def do_process_video(filepath: str, analysis: dict, max_bytes: int = 49 * 1024 *
             target_bps = max(150_000, int(safe_bytes * 8 / a["duration"]) - 128_000) if a["duration"] > 0 else 500_000
             cmd += ["-c:v", "libx264", "-b:v", str(target_bps), "-c:a", "aac", "-b:a", "128k"]
         else:
-            cmd += ["-c:v", "libx264", "-crf", "18", "-c:a", "copy"]
+            cmd += ["-c:v", "libx264", "-crf", "16", "-c:a", "copy"]
 
-        cmd += ["-preset", "veryfast", "-movflags", "+faststart", "-y", output_path]
+        cmd += ["-preset", "fast", "-movflags", "+faststart", "-y", output_path]
         subprocess.run(cmd, capture_output=True, check=True)
         result_mb = os.path.getsize(output_path) / 1024 / 1024
         logger.info(f"Processed: {result_mb:.1f}MB analysis={a}")
@@ -283,6 +283,16 @@ def record_stat(bot_data: dict, user_id: int, url: str, fmt_label: str):
 def ensure_not_cancelled(cancel_event: asyncio.Event | None):
     if cancel_event and cancel_event.is_set():
         raise asyncio.CancelledError
+
+
+async def run_in_executor_cancellable(loop, cancel_event, func, *args):
+    """Run a blocking function in executor, but raise CancelledError immediately if cancel_event is set."""
+    fut = loop.run_in_executor(None, func, *args)
+    while not fut.done():
+        if cancel_event and cancel_event.is_set():
+            raise asyncio.CancelledError
+        await asyncio.sleep(0.3)
+    return await fut
 
 
 def format_speed(speed: float | None) -> str:
@@ -786,12 +796,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "formats": info["formats"],
             "is_playlist": False,
         }
-        if info.get("thumbnail"):
-            try:
-                await update.message.reply_photo(photo=info["thumbnail"], caption=info["title"][:1024])
-            except Exception as thumb_error:
-                logger.warning(f"Thumbnail preview failed: {thumb_error}")
-
         await msg.edit_text(
             f"📹 *{info['title']}*\n\nElige el formato de descarga:",
             reply_markup=build_keyboard(url_key, info["formats"]),
@@ -1181,7 +1185,7 @@ async def perform_download(
             parse_mode="Markdown"
         )
         ensure_not_cancelled(cancel_event)
-        analysis = await loop.run_in_executor(None, analyze_video, filepath)
+        analysis = await run_in_executor_cancellable(loop, cancel_event, analyze_video, filepath)
         ensure_not_cancelled(cancel_event)
 
         steps = []
@@ -1204,7 +1208,7 @@ async def perform_download(
         )
         await safe_edit_text(status_message, status, parse_mode="Markdown")
 
-        filepath = await loop.run_in_executor(None, do_process_video, filepath, analysis)
+        filepath = await run_in_executor_cancellable(loop, cancel_event, do_process_video, filepath, analysis)
         ensure_not_cancelled(cancel_event)
 
         await safe_edit_text(status_message, "📤 *Enviando video...*", parse_mode="Markdown")
