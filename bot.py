@@ -60,72 +60,87 @@ def get_video_dimensions(filepath: str) -> tuple[int, int]:
     return 0, 0
 
 
-def process_video(filepath: str, max_bytes: int = 49 * 1024 * 1024) -> str:
-    """Normalize and compress in a single ffmpeg pass."""
-    try:
-        stream = _probe_video_stream(filepath)
-        coded_w = stream.get("width", 0)
-        coded_h = stream.get("height", 0)
-        sar = stream.get("sample_aspect_ratio") or "1:1"
-        rotate = stream.get("tags", {}).get("rotate") or "0"
-        codec = stream.get("codec_name", "")
-        file_size = os.path.getsize(filepath)
+def analyze_video(filepath: str, max_bytes: int = 49 * 1024 * 1024) -> dict:
+    """Probe the video and determine what processing is needed."""
+    stream = _probe_video_stream(filepath)
+    coded_w = stream.get("width", 0)
+    coded_h = stream.get("height", 0)
+    sar = stream.get("sample_aspect_ratio") or "1:1"
+    rotate = stream.get("tags", {}).get("rotate") or "0"
+    codec = stream.get("codec_name", "")
+    file_size = os.path.getsize(filepath)
 
-        needs_encode = codec not in ("h264", "avc1")
-        needs_sar_fix = sar not in ("1:1", "0:1", "")
-        needs_rotate_fix = rotate not in ("0", "")
-        needs_compress = file_size > max_bytes
+    detect = subprocess.run(
+        ["ffmpeg", "-i", filepath, "-vf", "cropdetect=24:16:0",
+         "-frames:v", "50", "-f", "null", "-"],
+        capture_output=True, text=True
+    )
+    crop_param = None
+    for line in detect.stderr.splitlines():
+        if "crop=" in line:
+            crop_param = line.split("crop=")[-1].strip()
 
-        # Detect black bars (50 frames is enough for consistent bars)
-        detect = subprocess.run(
-            ["ffmpeg", "-i", filepath, "-vf", "cropdetect=24:16:0",
-             "-frames:v", "50", "-f", "null", "-"],
-            capture_output=True, text=True
+    needs_crop = False
+    if crop_param:
+        parts = crop_param.split(":")
+        if len(parts) >= 2:
+            cw, ch = int(parts[0]), int(parts[1])
+            needs_crop = cw < coded_w * 0.99 or ch < coded_h * 0.99
+
+    duration = 0.0
+    if file_size > max_bytes:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "csv=p=0", filepath],
+            capture_output=True, text=True,
         )
-        crop_param = None
-        for line in detect.stderr.splitlines():
-            if "crop=" in line:
-                crop_param = line.split("crop=")[-1].strip()
+        duration = float(probe.stdout.strip() or 0)
 
-        needs_crop = False
-        if crop_param:
-            parts = crop_param.split(":")
-            if len(parts) >= 2:
-                cw, ch = int(parts[0]), int(parts[1])
-                needs_crop = cw < coded_w * 0.99 or ch < coded_h * 0.99
+    return {
+        "codec": codec,
+        "sar": sar,
+        "rotate": rotate,
+        "crop_param": crop_param if needs_crop else None,
+        "needs_encode": codec not in ("h264", "avc1"),
+        "needs_sar_fix": sar not in ("1:1", "0:1", ""),
+        "needs_rotate_fix": rotate not in ("0", ""),
+        "needs_crop": needs_crop,
+        "needs_compress": file_size > max_bytes,
+        "file_size": file_size,
+        "duration": duration,
+    }
 
-        if not any([needs_encode, needs_sar_fix, needs_rotate_fix, needs_crop, needs_compress]):
+
+def do_process_video(filepath: str, analysis: dict, max_bytes: int = 49 * 1024 * 1024) -> str:
+    """Run the actual ffmpeg processing based on analysis."""
+    try:
+        a = analysis
+        if not any([a["needs_encode"], a["needs_sar_fix"], a["needs_rotate_fix"],
+                    a["needs_crop"], a["needs_compress"]]):
             return filepath
 
         filters = []
-        if needs_sar_fix:
+        if a["needs_sar_fix"]:
             filters.append("scale=iw*sar:ih,setsar=1")
-        if needs_crop and crop_param:
-            filters.append(f"crop={crop_param}")
+        if a["needs_crop"] and a["crop_param"]:
+            filters.append(f"crop={a['crop_param']}")
 
         output_path = filepath.rsplit(".", 1)[0] + "_out.mp4"
         cmd = ["ffmpeg", "-i", filepath]
         if filters:
             cmd += ["-vf", ",".join(filters)]
 
-        if needs_compress:
-            probe = subprocess.run(
-                ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
-                 "-of", "csv=p=0", filepath],
-                capture_output=True, text=True,
-            )
-            duration = float(probe.stdout.strip() or 0)
+        if a["needs_compress"]:
             safe_bytes = int(max_bytes * 0.96)
-            target_bps = max(150_000, int(safe_bytes * 8 / duration) - 128_000) if duration > 0 else 500_000
-            cmd += ["-c:v", "libx264", "-b:v", str(target_bps),
-                    "-c:a", "aac", "-b:a", "128k"]
+            target_bps = max(150_000, int(safe_bytes * 8 / a["duration"]) - 128_000) if a["duration"] > 0 else 500_000
+            cmd += ["-c:v", "libx264", "-b:v", str(target_bps), "-c:a", "aac", "-b:a", "128k"]
         else:
             cmd += ["-c:v", "libx264", "-crf", "18", "-c:a", "copy"]
 
         cmd += ["-preset", "veryfast", "-movflags", "+faststart", "-y", output_path]
         subprocess.run(cmd, capture_output=True, check=True)
         result_mb = os.path.getsize(output_path) / 1024 / 1024
-        logger.info(f"Processed: {result_mb:.1f}MB codec={codec} crop={needs_crop} compress={needs_compress}")
+        logger.info(f"Processed: {result_mb:.1f}MB analysis={a}")
         return output_path
     except Exception as e:
         logger.warning(f"Video processing failed: {e}")
@@ -259,26 +274,43 @@ async def handle_format_selection(update: Update, context: ContextTypes.DEFAULT_
 
             logger.info(f"Downloaded file: {filepath}, size: {os.path.getsize(filepath)}")
 
-            await query.edit_message_text("📤 Enviando archivo...")
             with open(filepath, "rb") as f:
                 if fmt["ext"] == "mp3":
+                    await query.edit_message_text("📤 Enviando audio...")
                     await query.message.reply_audio(audio=f)
                 else:
                     size_mb = os.path.getsize(filepath) / 1024 / 1024
-                    if size_mb > 50:
-                        status = (
-                            f"⚙️ *Comprimiendo video* ({size_mb:.0f}MB → <50MB)\n"
-                            f"⏳ Esto puede tardar hasta 1 minuto..."
-                        )
-                    else:
-                        status = (
-                            f"⚙️ *Procesando video* ({size_mb:.0f}MB)\n"
-                            f"🔧 Verificando codec y calidad..."
-                        )
-                    await query.edit_message_text(status, parse_mode="Markdown")
-                    filepath = await asyncio.get_event_loop().run_in_executor(
-                        None, process_video, filepath
+                    await query.edit_message_text(
+                        f"🔍 *Analizando video* ({size_mb:.0f} MB)...",
+                        parse_mode="Markdown"
                     )
+                    loop = asyncio.get_event_loop()
+                    analysis = await loop.run_in_executor(None, analyze_video, filepath)
+
+                    # Build step-by-step status
+                    steps = []
+                    if analysis["needs_encode"]:
+                        steps.append(f"🔄 Convertir codec `{analysis['codec']}` → H.264")
+                    if analysis["needs_crop"]:
+                        steps.append("✂️ Recortar barras negras")
+                    if analysis["needs_sar_fix"]:
+                        steps.append("📐 Corregir proporción de píxeles")
+                    if analysis["needs_compress"]:
+                        steps.append(f"📦 Comprimir {size_mb:.0f}MB → <50MB")
+                    if not steps:
+                        steps.append("✅ Sin cambios necesarios, enviando tal cual")
+
+                    eta = "~1 minuto" if analysis["needs_compress"] else "~segundos"
+                    status = (
+                        f"⚙️ *Procesando video*\n\n"
+                        + "\n".join(f"  • {s}" for s in steps)
+                        + f"\n\n⏳ Tiempo estimado: {eta}"
+                    )
+                    await query.edit_message_text(status, parse_mode="Markdown")
+
+                    filepath = await loop.run_in_executor(None, do_process_video, filepath, analysis)
+
+                    await query.edit_message_text("📤 *Enviando video...*", parse_mode="Markdown")
                     width, height = get_video_dimensions(filepath)
                     with open(filepath, "rb") as fv:
                         await query.message.reply_video(
