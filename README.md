@@ -21,15 +21,30 @@
 
 ## 🎬 Formatos de descarga
 
+Los formatos disponibles se detectan **automáticamente** según el video. El bot muestra solo las resoluciones que realmente existen:
+
 | Formato | Descripción |
 |---|---|
-| 🎬 1080p MP4 | Full HD con audio |
-| 🎬 720p MP4 | HD con audio |
-| 🎬 480p MP4 | SD con audio |
-| 🎬 360p MP4 | Baja calidad con audio |
+| 🎬 8K (4320p) | Si está disponible |
+| 🎬 4K (2160p) | Si está disponible |
+| 🎬 1440p | Si está disponible |
+| 🎬 1080p | Full HD con audio |
+| 🎬 720p | HD con audio |
+| 🎬 480p | SD con audio |
+| 🎬 360p | Baja calidad con audio |
+| 🎬 240p | Mínima calidad |
 | 🎵 MP3 Audio | Solo audio en 192kbps |
 
 > ⚠️ Límite de Telegram: 50MB por archivo.
+
+## 🔧 Post-procesamiento automático
+
+Antes de enviar cada video, el bot aplica automáticamente con ffmpeg:
+
+- **Codec H.264**: Re-encodifica VP9/AV1 a H.264 para compatibilidad con Telegram
+- **Barras negras**: Detecta y recorta letterboxing/pillarboxing embebido (`cropdetect`)
+- **SAR/PAR**: Corrige píxeles no cuadrados para evitar imágenes estiradas
+- **Rotación**: Aplica metadatos de rotación correctamente
 
 ---
 

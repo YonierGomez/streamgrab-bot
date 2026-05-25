@@ -1,8 +1,11 @@
 import os
 import re
+import json
+import hashlib
 import tempfile
 import logging
 import asyncio
+import subprocess
 from dotenv import load_dotenv
 import yt_dlp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -17,38 +20,140 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-URL_REGEX = re.compile(
-    r"(https?://)?(www\.)?"
-    r"(youtube\.com/watch\?v=|youtu\.be/|"
-    r"facebook\.com/.+/videos/|fb\.watch/|fb\.com/|"
-    r"instagram\.com/(p|reel|tv)/|"
-    r"tiktok\.com/@.+/video/|vm\.tiktok\.com/)"
-    r"[\w\-\?=&%/.]+"
-)
+URL_REGEX = re.compile(r"https?://[^\s]+")
 
-FORMATS = [
-    {"label": "🎬 1080p MP4", "format": "bestvideo[height<=1080][vcodec^=avc]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]", "ext": "mp4"},
-    {"label": "🎬 720p MP4",  "format": "bestvideo[height<=720][vcodec^=avc]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]",   "ext": "mp4"},
-    {"label": "🎬 480p MP4",  "format": "bestvideo[height<=480][vcodec^=avc]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]",   "ext": "mp4"},
-    {"label": "🎬 360p MP4",  "format": "bestvideo[height<=360][vcodec^=avc]+bestaudio[ext=m4a]/bestvideo[height<=360]+bestaudio/best[height<=360]",   "ext": "mp4"},
-    {"label": "🎵 MP3 Audio", "format": "bestaudio/best", "ext": "mp3"},
+RESOLUTION_PRESETS = [
+    (4320, "🎬 8K (4320p)"),
+    (2160, "🎬 4K (2160p)"),
+    (1440, "🎬 1440p"),
+    (1080, "🎬 1080p"),
+    (720,  "🎬 720p"),
+    (480,  "🎬 480p"),
+    (360,  "🎬 360p"),
+    (240,  "🎬 240p"),
 ]
+
+
+def _probe_video_stream(filepath: str) -> dict:
+    result = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", filepath],
+        capture_output=True, text=True
+    )
+    data = json.loads(result.stdout)
+    for stream in data.get("streams", []):
+        if stream.get("codec_type") == "video":
+            return stream
+    return {}
+
+
+def get_video_dimensions(filepath: str) -> tuple[int, int]:
+    try:
+        stream = _probe_video_stream(filepath)
+        width = stream.get("width", 0)
+        height = stream.get("height", 0)
+        rotate = int(stream.get("tags", {}).get("rotate", 0))
+        if rotate in (90, 270):
+            width, height = height, width
+        return width, height
+    except Exception:
+        pass
+    return 0, 0
+
+
+def normalize_video(filepath: str) -> str:
+    """Ensure H.264 codec, crop black bars, fix SAR / rotation."""
+    try:
+        stream = _probe_video_stream(filepath)
+        coded_w = stream.get("width", 0)
+        coded_h = stream.get("height", 0)
+        sar = stream.get("sample_aspect_ratio") or "1:1"
+        rotate = stream.get("tags", {}).get("rotate") or "0"
+        codec = stream.get("codec_name", "")
+
+        # Telegram only plays H.264 reliably
+        needs_encode = codec not in ("h264", "avc1")
+
+        # Detect embedded black bars
+        detect = subprocess.run(
+            ["ffmpeg", "-i", filepath, "-vf", "cropdetect=24:16:0",
+             "-frames:v", "300", "-f", "null", "-"],
+            capture_output=True, text=True
+        )
+        crop_param = None
+        for line in detect.stderr.splitlines():
+            if "crop=" in line:
+                crop_param = line.split("crop=")[-1].strip()
+
+        needs_crop = False
+        if crop_param:
+            parts = crop_param.split(":")
+            if len(parts) >= 2:
+                cw, ch = int(parts[0]), int(parts[1])
+                needs_crop = cw < coded_w * 0.99 or ch < coded_h * 0.99
+
+        needs_sar_fix = sar not in ("1:1", "0:1", "")
+        needs_rotate_fix = rotate not in ("0", "")
+
+        if not needs_encode and not needs_crop and not needs_sar_fix and not needs_rotate_fix:
+            return filepath
+
+        filters = []
+        if needs_sar_fix:
+            filters.append("scale=iw*sar:ih,setsar=1")
+        if needs_crop and crop_param:
+            filters.append(f"crop={crop_param}")
+
+        output_path = filepath.rsplit(".", 1)[0] + "_norm.mp4"
+        cmd = ["ffmpeg", "-i", filepath]
+        if filters:
+            cmd += ["-vf", ",".join(filters)]
+        cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "fast",
+                "-c:a", "copy", "-movflags", "+faststart", "-y", output_path]
+        subprocess.run(cmd, capture_output=True, check=True)
+        logger.info(f"Normalized: codec={codec} crop={crop_param} sar={sar} rotate={rotate}")
+        return output_path
+    except Exception as e:
+        logger.warning(f"Video normalization failed: {e}")
+        return filepath
 
 
 def is_valid_url(text: str) -> bool:
     return bool(URL_REGEX.search(text))
 
 
-def get_video_title(url: str) -> str:
+def get_video_info(url: str) -> tuple[str, list[dict]]:
     with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
         info = ydl.extract_info(url, download=False)
-    return info.get("title", "video")
+
+    title = info.get("title", "video")
+    available_heights = {
+        fmt.get("height")
+        for fmt in info.get("formats", [])
+        if fmt.get("height")
+    }
+
+    formats = []
+    for height, label in RESOLUTION_PRESETS:
+        if any(h >= height for h in available_heights):
+            formats.append({
+                "label": label,
+                "ext": "mp4",
+                "format": (
+                    f"bestvideo[height<={height}][vcodec^=avc]+bestaudio"
+                    f"/bestvideo[height<={height}]+bestaudio"
+                    f"/best[height<={height}]/best"
+                ),
+            })
+
+    # Always offer MP3
+    formats.append({"label": "🎵 MP3 Audio", "format": "bestaudio/best", "ext": "mp3"})
+    return title, formats
 
 
-def build_keyboard(url: str) -> InlineKeyboardMarkup:
+def build_keyboard(url_key: str, formats: list[dict]) -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(f["label"], callback_data=f"{i}|{url}")]
-        for i, f in enumerate(FORMATS)
+        [InlineKeyboardButton(f["label"], callback_data=f"{i}|{url_key}")]
+        for i, f in enumerate(formats)
     ]
     return InlineKeyboardMarkup(buttons)
 
@@ -68,13 +173,13 @@ def download_video(url: str, fmt: dict, output_dir: str) -> str | None:
             "preferredquality": "192",
         }]
     else:
-        # Re-encode to H.264 if needed so Telegram can play it inline
+        # Re-encode to H.264 only if needed (AV1, VP9, etc.)
         ydl_opts["postprocessors"] = [{
-            "key": "FFmpegVideoConvertor",
+            "key": "FFmpegVideoRemuxer",
             "preferedformat": "mp4",
         }]
         ydl_opts["postprocessor_args"] = {
-            "ffmpegvideoconvertor": ["-vcodec", "libx264", "-acodec", "aac", "-preset", "fast"]
+            "ffmpegvideoremuxer": ["-c", "copy"]
         }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
@@ -96,15 +201,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
     if not is_valid_url(url):
-        await update.message.reply_text("❌ Eso no parece una URL de YouTube válida.")
+        await update.message.reply_text("❌ Envíame una URL válida (debe comenzar con http:// o https://).")
         return
 
     msg = await update.message.reply_text("🔍 Obteniendo información del video...")
     try:
-        title = await asyncio.get_event_loop().run_in_executor(None, get_video_title, url)
+        title, formats = await asyncio.get_event_loop().run_in_executor(None, get_video_info, url)
+        url_key = hashlib.md5(url.encode()).hexdigest()[:12]
+        context.bot_data[url_key] = {"url": url, "formats": formats}
         await msg.edit_text(
             f"📹 *{title}*\n\nElige el formato de descarga:",
-            reply_markup=build_keyboard(url),
+            reply_markup=build_keyboard(url_key, formats),
             parse_mode="Markdown"
         )
     except Exception as e:
@@ -117,8 +224,13 @@ async def handle_format_selection(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
 
     try:
-        idx, url = query.data.split("|", 1)
-        fmt = FORMATS[int(idx)]
+        idx, url_key = query.data.split("|", 1)
+        entry = context.bot_data.get(url_key)
+        if not entry:
+            await query.edit_message_text("❌ URL expirada. Envía el enlace de nuevo.")
+            return
+        url = entry["url"]
+        fmt = entry["formats"][int(idx)]
 
         await query.edit_message_text(f"⬇️ Descargando en {fmt['label']}... esto puede tardar un momento.")
 
@@ -144,7 +256,17 @@ async def handle_format_selection(update: Update, context: ContextTypes.DEFAULT_
                 if fmt["ext"] == "mp3":
                     await query.message.reply_audio(audio=f)
                 else:
-                    await query.message.reply_video(video=f)
+                    filepath = await asyncio.get_event_loop().run_in_executor(
+                        None, normalize_video, filepath
+                    )
+                    width, height = get_video_dimensions(filepath)
+                    with open(filepath, "rb") as fv:
+                        await query.message.reply_video(
+                            video=fv,
+                            width=width or None,
+                            height=height or None,
+                            supports_streaming=True,
+                        )
 
         await query.delete_message()
 
