@@ -1,12 +1,23 @@
 # 📥 StreamGrab Bot
 
-![Python](https://img.shields.io/badge/python-3.12+-blue?style=flat-square)
-![Docker](https://img.shields.io/badge/docker-ready-2496ED?style=flat-square&logo=docker&logoColor=white)
-![yt-dlp](https://img.shields.io/badge/yt--dlp-2026.3.17-red?style=flat-square)
-![Telegram](https://img.shields.io/badge/telegram-bot-26A5E4?style=flat-square&logo=telegram&logoColor=white)
-![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
+[![Docker Hub](https://img.shields.io/docker/pulls/yoniergomez/streamgrab?logo=docker&label=Docker%20Pulls)](https://hub.docker.com/r/yoniergomez/streamgrab)
+[![Docker Image Size](https://img.shields.io/docker/image-size/yoniergomez/streamgrab/latest?logo=docker&label=Image%20Size)](https://hub.docker.com/r/yoniergomez/streamgrab)
+[![GitHub Release](https://img.shields.io/github/v/release/YonierGomez/streamgrab-bot?logo=github&label=Release)](https://github.com/YonierGomez/streamgrab-bot/releases)
+[![CI Status](https://img.shields.io/github/actions/workflow/status/YonierGomez/streamgrab-bot/docker-image.yml?logo=githubactions&label=CI)](https://github.com/YonierGomez/streamgrab-bot/actions)
+[![GitHub Stars](https://img.shields.io/github/stars/YonierGomez/streamgrab-bot?style=flat&logo=github&label=Stars)](https://github.com/YonierGomez/streamgrab-bot/stargazers)
+[![GitHub License](https://img.shields.io/github/license/YonierGomez/streamgrab-bot?logo=opensourceinitiative&label=License)](https://github.com/YonierGomez/streamgrab-bot/blob/main/LICENSE)
 
-> Bot de Telegram que descarga videos de YouTube, Facebook, Instagram y TikTok en múltiples formatos con solo pegar la URL.
+### Tecnologías
+
+![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white)
+![Telegram](https://img.shields.io/badge/Telegram-26A5E4?logo=telegram&logoColor=white)
+![GitHub Actions](https://img.shields.io/badge/GitHub_Actions-2088FF?logo=githubactions&logoColor=white)
+![ffmpeg](https://img.shields.io/badge/ffmpeg-007808?logo=ffmpeg&logoColor=white)
+![ARM](https://img.shields.io/badge/ARM-0091BD?logo=arm&logoColor=white)
+![x86-64](https://img.shields.io/badge/x86--64-blue)
+
+> Bot de Telegram que descarga videos de YouTube, Facebook, Instagram, TikTok, Twitter/X, Vimeo, Reddit y Twitch en múltiples formatos con solo pegar la URL.
 
 ---
 
@@ -14,10 +25,14 @@
 
 | Plataforma | Tipos de contenido |
 |---|---|
-| ▶️ YouTube | Videos, Shorts |
+| ▶️ YouTube | Videos, Shorts, Playlists |
 | 📘 Facebook | Videos públicos |
 | 📸 Instagram | Posts, Reels, IGTV |
 | 🎵 TikTok | Videos |
+| 🐦 Twitter/X | Videos y GIFs |
+| 📹 Vimeo | Videos |
+| 👾 Reddit | Videos |
+| 🎮 Twitch | Clips |
 
 ## 🎬 Formatos de descarga
 
@@ -50,7 +65,28 @@ Antes de enviar cada video, el bot aplica automáticamente con ffmpeg:
 
 ## 🚀 Inicio rápido
 
-### Con Docker (recomendado)
+### Desde Docker Hub (recomendado)
+
+```bash
+docker run -d --name streamgrab \
+  -e BOT_TOKEN=your_token_here \
+  yoniergomez/streamgrab
+```
+
+### Con Docker Compose
+
+```yaml
+services:
+  streamgrab:
+    image: yoniergomez/streamgrab
+    container_name: streamgrab
+    restart: always
+    environment:
+      - BOT_TOKEN=your_token_here
+      - ADMIN_ID=your_telegram_id  # opcional
+```
+
+### Desde el código fuente
 
 ```bash
 # 1. Clonar el repositorio
@@ -87,45 +123,78 @@ python bot.py
 
 ## 🔧 Configuración
 
-| Variable | Descripción |
-|---|---|
-| `BOT_TOKEN` | Token del bot obtenido desde [@BotFather](https://t.me/BotFather) |
+| Variable | Descripción | Requerido |
+|---|---|---|
+| `BOT_TOKEN` | Token del bot desde [@BotFather](https://t.me/BotFather) | ✅ |
+| `ADMIN_ID` | Tu Telegram user ID para acceder a `/admin` | ❌ |
 
 ---
 
-## 🐳 Docker
+## 🐳 Docker Hub
 
 ```bash
-# Build
-docker build -t streamgrab-bot .
+# Pull
+docker pull yoniergomez/streamgrab
 
 # Run
-docker run -d --name streamgrab-bot --env-file .env streamgrab-bot
+docker run -d --name streamgrab -e BOT_TOKEN=tu_token yoniergomez/streamgrab
 
 # Logs
-docker logs -f streamgrab-bot
-
-# Stop
-docker rm -f streamgrab-bot
+docker logs -f streamgrab
 ```
 
+### Arquitecturas soportadas
+
+| Arquitectura | Dispositivos |
+|---|---|
+| linux/amd64 | PCs, servidores, VMs |
+| linux/arm64 | Raspberry Pi 4/5, Apple Silicon, Orange Pi 5 |
+
 ---
+
+## 📋 Comandos
+
+| Comando | Descripción |
+|---|---|
+| `/start` | Mensaje de bienvenida |
+| `/help` | Lista completa de funcionalidades |
+| `/history` | Últimas 10 descargas con botones para repetir |
+| `/stats` | Tus estadísticas de descarga |
+| `/cancel` | Cancela la descarga en curso |
+| `/admin` | Panel global de uso _(requiere `ADMIN_ID`)_ |
 
 ## 📖 Uso
 
-1. Abre tu bot en Telegram y envía `/start`
+1. Envía `/start` o `/help` para ver las opciones
 2. Pega la URL del video
-3. Selecciona el formato deseado
-4. Recibe el archivo directamente en el chat
+3. El bot muestra la miniatura y los formatos disponibles
+4. Selecciona el formato — el bot informa el progreso en tiempo real
+5. Recibe el archivo directamente en el chat
+
+**Opciones adicionales al descargar:**
+- 🖼 **Portada** — descarga solo la miniatura como imagen
+- 📝 **Subtítulos** — descarga el `.srt` si está disponible
+- ✂️ **Recortar** — elige un fragmento con formato `MM:SS MM:SS`
 
 ---
 
 ## 🛠️ Stack
 
 - [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot) 22.7
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp) 2026.3.17
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp)
 - [ffmpeg](https://ffmpeg.org/)
 - Docker + Python 3.12 slim
+
+## 🔗 Links
+
+- [Docker Hub](https://hub.docker.com/r/yoniergomez/streamgrab)
+- [GitHub](https://github.com/YonierGomez/streamgrab-bot)
+- [Releases](https://github.com/YonierGomez/streamgrab-bot/releases)
+
+## Apoya el proyecto
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy_Me_A_Coffee-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/yoniergomez)
+[![GitHub Sponsors](https://img.shields.io/badge/GitHub_Sponsors-EA4AAA?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/YonierGomez)
 
 ## 📄 Licencia
 
