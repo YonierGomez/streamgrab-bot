@@ -17,7 +17,7 @@
 ![ARM](https://img.shields.io/badge/ARM-0091BD?logo=arm&logoColor=white)
 ![x86-64](https://img.shields.io/badge/x86--64-blue)
 
-> Bot de Telegram que descarga videos de YouTube, Facebook, Instagram, TikTok, Twitter/X, Vimeo, Reddit y Twitch en múltiples formatos con solo pegar la URL.
+> Bot de Telegram que descarga videos de YouTube, Facebook, Instagram, TikTok, Twitter/X, Vimeo, Reddit, Twitch, SoundCloud, Dailymotion, Rumble, Streamable, Bilibili, Pinterest, LinkedIn, Snapchat, Likee, Tumblr, Kick, Triller y más en múltiples formatos con solo pegar la URL.
 
 ---
 
@@ -26,13 +26,26 @@
 | Plataforma | Tipos de contenido |
 |---|---|
 | ▶️ YouTube | Videos, Shorts, Playlists |
-| 📘 Facebook | Videos públicos |
+| 🎵 YouTube Music | Canciones y álbumes |
+| 📘 Facebook | Videos públicos, Reels |
 | 📸 Instagram | Posts, Reels, IGTV |
 | 🎵 TikTok | Videos |
 | 🐦 Twitter/X | Videos y GIFs |
 | 📹 Vimeo | Videos |
 | 👾 Reddit | Videos |
-| 🎮 Twitch | Clips |
+| 🎮 Twitch | Clips, VODs, streams |
+| 🎵 SoundCloud | Tracks y playlists |
+| 📺 Dailymotion | Videos |
+| 🎬 Rumble | Videos |
+| 📡 Streamable | Videos |
+| 🎥 Bilibili | Videos |
+| 📌 Pinterest | Videos |
+| 💼 LinkedIn | Videos |
+| 👻 Snapchat | Spotlight |
+| 👍 Likee | Videos |
+| 🎬 Tumblr | Videos |
+| 🟣 Kick | Clips, VODs, streams |
+| 🎵 Triller | Videos |
 
 ## 🎬 Formatos de descarga
 
@@ -119,7 +132,6 @@ python downloader.py
 - Python 3.12+
 - [ffmpeg](https://ffmpeg.org/download.html) instalado en el PATH
 - Token de bot de Telegram ([@BotFather](https://t.me/BotFather))
-- Node.js (para yt-dlp-ejs, incluido en Docker)
 
 ## 🔧 Configuración
 
