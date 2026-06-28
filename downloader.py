@@ -38,8 +38,26 @@ URL_REGEX = re.compile(r"https?://[^\s]+")
 TRIM_REGEX = re.compile(r"^\d+:\d+\s+\d+:\d+$")
 WORK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot_work")
 SUPPORTED_DOMAINS = {
-    "youtube.com", "youtu.be", "facebook.com", "fb.watch", "instagram.com",
-    "tiktok.com", "twitter.com", "x.com", "vimeo.com", "reddit.com", "twitch.tv",
+    "youtube.com", "youtu.be", "music.youtube.com",
+    "facebook.com", "fb.watch", "fb.com",
+    "instagram.com",
+    "tiktok.com", "vm.tiktok.com",
+    "twitter.com", "x.com",
+    "vimeo.com",
+    "reddit.com",
+    "twitch.tv",
+    "soundcloud.com",
+    "dailymotion.com",
+    "rumble.com",
+    "streamable.com",
+    "bilibili.com", "b23.tv",
+    "pinterest.com", "pin.it",
+    "linkedin.com",
+    "snapchat.com",
+    "likee.video",
+    "tumblr.com",
+    "kick.com",
+    "triller.co",
 }
 DOWNLOAD_PROGRESS = {}
 
@@ -253,13 +271,13 @@ def get_cancellation_event(user_id: int, bot_data: dict) -> asyncio.Event:
 
 def detect_platform(url: str) -> str:
     lowered = url.lower()
-    if any(domain in lowered for domain in ("youtube.com", "youtu.be")):
+    if any(domain in lowered for domain in ("youtube.com", "youtu.be", "music.youtube.com")):
         return "YouTube"
     if any(domain in lowered for domain in ("instagram.com",)):
         return "Instagram"
-    if any(domain in lowered for domain in ("tiktok.com",)):
+    if any(domain in lowered for domain in ("tiktok.com", "vm.tiktok.com")):
         return "TikTok"
-    if any(domain in lowered for domain in ("facebook.com", "fb.watch")):
+    if any(domain in lowered for domain in ("facebook.com", "fb.watch", "fb.com")):
         return "Facebook"
     if any(domain in lowered for domain in ("twitter.com", "x.com")):
         return "Twitter"
@@ -269,6 +287,30 @@ def detect_platform(url: str) -> str:
         return "Reddit"
     if "twitch.tv" in lowered:
         return "Twitch"
+    if "soundcloud.com" in lowered:
+        return "SoundCloud"
+    if "dailymotion.com" in lowered:
+        return "Dailymotion"
+    if "rumble.com" in lowered:
+        return "Rumble"
+    if "streamable.com" in lowered:
+        return "Streamable"
+    if any(domain in lowered for domain in ("bilibili.com", "b23.tv")):
+        return "Bilibili"
+    if any(domain in lowered for domain in ("pinterest.com", "pin.it")):
+        return "Pinterest"
+    if "linkedin.com" in lowered:
+        return "LinkedIn"
+    if "snapchat.com" in lowered:
+        return "Snapchat"
+    if "likee.video" in lowered:
+        return "Likee"
+    if "tumblr.com" in lowered:
+        return "Tumblr"
+    if "kick.com" in lowered:
+        return "Kick"
+    if "triller.co" in lowered:
+        return "Triller"
     return "Otro"
 
 
@@ -637,8 +679,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Video Downloader Bot*\n\n"
         "Envíame el enlace de un video de:\n"
-        "▶️ YouTube  📘 Facebook  📸 Instagram  🎵 TikTok\n"
-        "🐦 Twitter/X  📹 Vimeo  👾 Reddit  🎮 Twitch",
+        "▶️ YouTube  🎵 YouTube Music  📘 Facebook  📸 Instagram\n"
+        "🎵 TikTok  🐦 Twitter/X  📹 Vimeo  👾 Reddit  🎮 Twitch\n"
+        "🎵 SoundCloud  📺 Dailymotion  🎬 Rumble  📡 Streamable\n"
+        "🎥 Bilibili  📌 Pinterest  💼 LinkedIn  👻 Snapchat\n"
+        "👍 Likee  🎬 Tumblr  🟣 Kick  🎵 Triller",
         parse_mode="Markdown"
     )
 
@@ -661,8 +706,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📖 *¿Qué puedo hacer?*\n\n"
         "Envíame el enlace de un video y te mostraré opciones de descarga.\n\n"
         "🌐 *Plataformas soportadas*\n"
-        "▶️ YouTube  📘 Facebook  📸 Instagram  🎵 TikTok\n"
-        "🐦 Twitter/X  📹 Vimeo  👾 Reddit  🎮 Twitch\n\n"
+        "▶️ YouTube  🎵 YouTube Music  📘 Facebook  📸 Instagram\n"
+        "🎵 TikTok  🐦 Twitter/X  📹 Vimeo  👾 Reddit  🎮 Twitch\n"
+        "🎵 SoundCloud  📺 Dailymotion  🎬 Rumble  📡 Streamable\n"
+        "🎥 Bilibili  📌 Pinterest  💼 LinkedIn  👻 Snapchat\n"
+        "👍 Likee  🎬 Tumblr  🟣 Kick  🎵 Triller\n\n"
         "🎛 *Al descargar puedes:*\n"
         "• Elegir calidad (240p → 8K)\n"
         "• 🖼 Descargar solo la portada\n"
@@ -784,6 +832,17 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not is_valid_url(text):
         await update.message.reply_text("❌ Envíame una URL válida (debe comenzar con http:// o https://).")
+        return
+
+    if "threads.net" in text.lower() or "threads.com" in text.lower():
+        await update.message.reply_text(
+            "🧵 *Threads no está soportado*\n\n"
+            "Threads requiere un navegador completo para cargar su contenido, "
+            "lo que no es compatible con este bot.\n\n"
+            "Puedes intentar descargar el video desde [SnapThreads](https://snapthreads.net) u otro servicio online.",
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
         return
 
     msg = await update.message.reply_text("🔍 Obteniendo información del video...")
