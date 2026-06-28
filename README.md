@@ -109,7 +109,7 @@ python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 # Edita .env con tu BOT_TOKEN
-python bot.py
+python downloader.py
 ```
 
 ---

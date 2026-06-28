@@ -10,6 +10,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py .
+COPY downloader.py .
 
-CMD ["python", "bot.py"]
+CMD ["python", "downloader.py"]
