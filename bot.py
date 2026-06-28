@@ -150,7 +150,7 @@ def analyze_video(filepath: str, max_bytes: int = 49 * 1024 * 1024) -> dict:
         "sar": sar,
         "rotate": rotate,
         "crop_param": crop_param if needs_crop else None,
-        "needs_encode": codec not in ("h264", "avc1", "hevc", "h265"),
+        "needs_encode": codec not in ("h264", "avc1"),
         "needs_sar_fix": sar not in ("1:1", "0:1", ""),
         "needs_rotate_fix": rotate not in ("0", ""),
         "needs_crop": needs_crop,
@@ -183,10 +183,10 @@ def do_process_video(filepath: str, analysis: dict, max_bytes: int = 49 * 1024 *
             safe_bytes = int(max_bytes * 0.96)
             target_bps = max(150_000, int(safe_bytes * 8 / a["duration"]) - 128_000) if a["duration"] > 0 else 500_000
             cmd += ["-c:v", "libx264", "-b:v", str(target_bps), "-c:a", "aac", "-b:a", "128k"]
+            cmd += ["-preset", "fast", "-movflags", "+faststart", "-y", output_path]
         else:
             cmd += ["-c:v", "libx264", "-crf", "23", "-c:a", "copy"]
-
-        cmd += ["-preset", "fast", "-movflags", "+faststart", "-y", output_path]
+            cmd += ["-preset", "ultrafast", "-movflags", "+faststart", "-y", output_path]
         subprocess.run(cmd, capture_output=True, check=True)
         result_mb = os.path.getsize(output_path) / 1024 / 1024
         logger.info(f"Processed: {result_mb:.1f}MB analysis={a}")
