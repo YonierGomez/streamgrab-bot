@@ -150,7 +150,7 @@ def analyze_video(filepath: str, max_bytes: int = 49 * 1024 * 1024) -> dict:
         "sar": sar,
         "rotate": rotate,
         "crop_param": crop_param if needs_crop else None,
-        "needs_encode": codec not in ("h264", "avc1"),
+        "needs_encode": codec not in ("h264", "avc1", "hevc", "h265"),
         "needs_sar_fix": sar not in ("1:1", "0:1", ""),
         "needs_rotate_fix": rotate not in ("0", ""),
         "needs_crop": needs_crop,
